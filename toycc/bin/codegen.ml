@@ -23,14 +23,10 @@ let rec emit_program prog =
   let buf = Buffer.create 1024 in
   (* 添加全局数据段 *)
   Buffer.add_string buf ".data\n";
-  List.iter (fun f -> emit_function_data buf f) prog;
+  List.iter (fun f -> ()) prog;  (* 移除了对 emit_function_data 的调用 *)
   Buffer.add_string buf "\n.text\n.align 2\n";
   List.iter (fun f -> emit_function buf f) prog;
   Buffer.contents buf
-
-and emit_function_data buf f =
-  (* 为函数中的变量分配空间 *)
-  ()
 
 and emit_function buf f =
   Buffer.add_string buf (Printf.sprintf ".globl %s\n%s:\n" f.name f.name);
