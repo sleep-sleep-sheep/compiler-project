@@ -23,29 +23,30 @@ let rec emit_program prog =
   let buf = Buffer.create 1024 in
   (* 添加全局数据段 *)
   Buffer.add_string buf ".data\n";
-  List.iter (fun f -> ()) prog;  (* 移除了对 emit_function_data 的调用 *)
-  Buffer.add_string buf "\n.text\n.align 2\n";
-  List.iter (fun f -> emit_function buf f) prog;
+  Buffer.add_string buf ".globl _start\n\n";
+  Buffer.add_string buf ".text\n.align 2\n";
+  List.iter (emit_function buf) prog;
   Buffer.contents buf
 
 and emit_function buf f =
+  (* 计算局部变量所需空间 - 在实际应用中应通过分析AST确定 *)
+  let locals_size = 32 in  (* 假设需要32字节存储局部变量 *)
+  
   Buffer.add_string buf (Printf.sprintf ".globl %s\n%s:\n" f.name f.name);
+  
   (* 保存调用者保存的寄存器 *)
-  Buffer.add_string buf "  addi sp, sp, -32\n";
-  Buffer.add_string buf "  sw ra, 28(sp)\n";
-  Buffer.add_string buf "  sw s0, 24(sp)\n";  (* s0 用作 fp *)
-  Buffer.add_string buf "  sw s1, 20(sp)\n";
-  Buffer.add_string buf "  sw s2, 16(sp)\n";
-  Buffer.add_string buf "  sw s3, 12(sp)\n";
-  Buffer.add_string buf "  sw s4, 8(sp)\n";
-  Buffer.add_string buf "  sw s5, 4(sp)\n";
-  Buffer.add_string buf "  sw s6, 0(sp)\n";
+  Buffer.add_string buf "  addi sp, sp, -40\n";  (* 32字节保存寄存器 + 8字节对齐 *)
+  Buffer.add_string buf "  sw ra, 36(sp)\n";
+  Buffer.add_string buf "  sw s0, 32(sp)\n";  (* s0 用作 fp *)
+  Buffer.add_string buf "  sw s1, 28(sp)\n";
+  Buffer.add_string buf "  sw s2, 24(sp)\n";
+  Buffer.add_string buf "  sw s3, 20(sp)\n";
+  Buffer.add_string buf "  sw s4, 16(sp)\n";
+  Buffer.add_string buf "  sw s5, 12(sp)\n";
+  Buffer.add_string buf "  sw s6, 8(sp)\n";
   Buffer.add_string buf "  mv s0, sp\n";  (* 设置帧指针 *)
   
-  (* 为局部变量分配空间 - 修改后的版本 *)
-  (* 这里假设局部变量数量可以通过遍历函数体来确定 *)
-  (* 实际实现可能需要更复杂的AST分析 *)
-  let locals_size = 16 in  (* 假设局部变量需要16字节空间 *)
+  (* 为局部变量分配空间 *)
   if locals_size > 0 then begin
     Buffer.add_string buf (Printf.sprintf "  addi sp, sp, -%d\n" locals_size)
   end;
@@ -56,15 +57,15 @@ and emit_function buf f =
   if locals_size > 0 then begin
     Buffer.add_string buf (Printf.sprintf "  addi sp, s0, 0\n")
   end;
-  Buffer.add_string buf "  lw ra, 28(sp)\n";
-  Buffer.add_string buf "  lw s0, 24(sp)\n";
-  Buffer.add_string buf "  lw s1, 20(sp)\n";
-  Buffer.add_string buf "  lw s2, 16(sp)\n";
-  Buffer.add_string buf "  lw s3, 12(sp)\n";
-  Buffer.add_string buf "  lw s4, 8(sp)\n";
-  Buffer.add_string buf "  lw s5, 4(sp)\n";
-  Buffer.add_string buf "  lw s6, 0(sp)\n";
-  Buffer.add_string buf "  addi sp, sp, 32\n";
+  Buffer.add_string buf "  lw ra, 36(sp)\n";
+  Buffer.add_string buf "  lw s0, 32(sp)\n";
+  Buffer.add_string buf "  lw s1, 28(sp)\n";
+  Buffer.add_string buf "  lw s2, 24(sp)\n";
+  Buffer.add_string buf "  lw s3, 20(sp)\n";
+  Buffer.add_string buf "  lw s4, 16(sp)\n";
+  Buffer.add_string buf "  lw s5, 12(sp)\n";
+  Buffer.add_string buf "  lw s6, 8(sp)\n";
+  Buffer.add_string buf "  addi sp, sp, 40\n";
   Buffer.add_string buf "  ret\n\n"
 
 and emit_stmt buf = function
@@ -72,23 +73,23 @@ and emit_stmt buf = function
   | SExpr e -> emit_expr buf e; Buffer.add_string buf "  addi sp, sp, 4  # pop\n"
   | SDecl (id, e) -> 
       emit_expr buf e;
-      (* 假设变量存储在栈上 *)
-      Buffer.add_string buf "  mv t1, s0\n";  (* 帧指针 *)
-      Buffer.add_string buf "  addi t1, t1, -4\n";  (* 假设第一个局部变量位置 *)
-      Buffer.add_string buf "  sw t0, 0(t1)\n";
-      Buffer.add_string buf (Printf.sprintf "  # 变量 %s 存储在 t1\n" id)
+      (* 假设变量存储在帧指针下方的偏移位置 *)
+      let offset = -4 in  (* 第一个局部变量的偏移 *)
+      Buffer.add_string buf (Printf.sprintf "  sw t0, %d(s0)\n" offset);
+      Buffer.add_string buf (Printf.sprintf "  # 声明变量 %s\n" id)
   | SAssign (id, e) -> 
       emit_expr buf e;
-      (* 假设变量存储在栈上 *)
-      Buffer.add_string buf "  mv t1, s0\n";  (* 帧指针 *)
-      Buffer.add_string buf "  addi t1, t1, -4\n";  (* 假设第一个局部变量位置 *)
-      Buffer.add_string buf "  sw t0, 0(t1)\n";
-      Buffer.add_string buf (Printf.sprintf "  # 变量 %s 赋值\n" id)
+      (* 假设变量存储在帧指针下方的偏移位置 *)
+      let offset = -4 in  (* 第一个局部变量的偏移 *)
+      Buffer.add_string buf (Printf.sprintf "  sw t0, %d(s0)\n" offset);
+      Buffer.add_string buf (Printf.sprintf "  # 赋值变量 %s\n" id)
   | SReturn (Some e) ->  
       emit_expr buf e; 
-      Buffer.add_string buf "  mv a0, t0  # 将返回值存入 a0\n"  
+      Buffer.add_string buf "  mv a0, t0  # 将返回值存入 a0\n";
+      emit_function_epilogue buf
   | SReturn None ->  
-      Buffer.add_string buf "  li a0, 0  # void 返回 0\n"  
+      Buffer.add_string buf "  li a0, 0  # void 返回 0\n";
+      emit_function_epilogue buf
   | SIf (cond, t, Some el) ->
       let l1 = fresh_label () and l2 = fresh_label () in
       emit_expr buf cond;
@@ -119,18 +120,31 @@ and emit_stmt buf = function
       Buffer.add_string buf (Printf.sprintf "  j %s\n" l);
       Buffer.add_string buf (Printf.sprintf "%s:\n" l)
 
+and emit_function_epilogue buf =
+  (* 恢复栈和寄存器 *)
+  Buffer.add_string buf "  mv sp, s0\n";  (* 恢复栈指针 *)
+  Buffer.add_string buf "  lw ra, 36(sp)\n";
+  Buffer.add_string buf "  lw s0, 32(sp)\n";
+  Buffer.add_string buf "  lw s1, 28(sp)\n";
+  Buffer.add_string buf "  lw s2, 24(sp)\n";
+  Buffer.add_string buf "  lw s3, 20(sp)\n";
+  Buffer.add_string buf "  lw s4, 16(sp)\n";
+  Buffer.add_string buf "  lw s5, 12(sp)\n";
+  Buffer.add_string buf "  lw s6, 8(sp)\n";
+  Buffer.add_string buf "  addi sp, sp, 40\n";
+  Buffer.add_string buf "  ret\n"
+
 and emit_expr buf = function
   | EInt n -> 
       if n >= -2048 && n <= 2047 then
         Buffer.add_string buf (Printf.sprintf "  li t0, %d\n" n)
       else
         Buffer.add_string buf (Printf.sprintf "  lui t0, %d\n  addi t0, t0, %d\n" 
-                                 (n lsr 12) (n land 0xFFF))
+                                 ((n lsr 12) land 0xFFFFF) (n land 0xFFF))
   | EVar id -> 
-      (* 假设变量存储在栈上 *)
-      Buffer.add_string buf "  mv t0, s0\n";  (* 帧指针 *)
-      Buffer.add_string buf "  addi t0, t0, -4\n";  (* 假设第一个局部变量位置 *)
-      Buffer.add_string buf "  lw t0, 0(t0)\n";
+      (* 假设变量存储在帧指针下方的偏移位置 *)
+      let offset = -4 in  (* 第一个局部变量的偏移 *)
+      Buffer.add_string buf (Printf.sprintf "  lw t0, %d(s0)\n" offset);
       Buffer.add_string buf (Printf.sprintf "  # 加载变量 %s\n" id)
   | EBin (op, e1, e2) ->
       emit_expr buf e1;
