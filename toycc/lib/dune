@@ -1,0 +1,12 @@
+(executable
+ (name main)
+ (public_name toycc)
+ (modules ast lexer parser semantic optimize codegen main)
+ )
+
+;; 注释或删除以下自动生成规则
+;;(ocamllex
+;; (modules lexer))
+;;
+;;(menhir
+;; (modules parser))
