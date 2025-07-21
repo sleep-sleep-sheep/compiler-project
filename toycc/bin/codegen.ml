@@ -2,7 +2,7 @@
 
 open Ast
 
-(* 寄存器分配 *)
+(* 寄存器定义（内联模块，无需单独open） *)
 module Register = struct
   type t = 
     | Zero  (* x0 *)
@@ -13,7 +13,7 @@ module Register = struct
     | T0    (* x5 *)
     | T1    (* x6 *)
     | T2    (* x7 *)
-    | S0    (* x8 *)
+    | S0    (* x8/fp *)
     | S1    (* x9 *)
     | A0    (* x10 *)
     | A1    (* x11 *)
@@ -73,29 +73,39 @@ module Register = struct
     | T6 -> "x31"
 end
 
-(* 生成器状态 *)
+(* 循环标签信息（用于break和continue） *)
+type loop_labels = {
+  cond_label: string;  (* 循环条件检查标签 *)
+  end_label: string;   (* 循环结束标签 *)
+}
+
+(* 生成器状态（使用可变缩进） *)
 type state = {
   mutable label_count: int;
   output: Buffer.t;
-  indent_level: int;
+  indent_level: int ref;  (* 可变缩进级别 *)
+  var_offsets: (string, int) Hashtbl.t;  (* 变量名到栈偏移量的映射 *)
+  mutable loop_stack: loop_labels list;  (* 循环标签栈（可变） *)
 }
 
 (* 创建新的生成器状态 *)
-let create_state () = {
+let create_state var_offsets = {
   label_count = 0;
   output = Buffer.create 1024;
-  indent_level = 0;
+  indent_level = ref 0;  (* 初始缩进0 *)
+  var_offsets;
+  loop_stack = [];
 }
 
 (* 生成新的标签 *)
 let new_label state prefix =
   let count = state.label_count in
   state.label_count <- count + 1;
-  prefix ^ string_of_int count
+  prefix ^ "_" ^ string_of_int count
 
 (* 输出缩进 *)
 let emit_indent state =
-  for _ = 1 to state.indent_level do
+  for _ = 1 to !(state.indent_level) do
     Buffer.add_string state.output "  "
   done
 
@@ -105,15 +115,15 @@ let emit_line state line =
   Buffer.add_string state.output line;
   Buffer.add_char state.output '\n'
 
-(* 增加缩进 *)
+(* 增加缩进（直接修改状态） *)
 let indent state =
-  { state with indent_level = state.indent_level + 1 }
+  state.indent_level := !(state.indent_level) + 1
 
-(* 减少缩进 *)
+(* 减少缩进（直接修改状态） *)
 let unindent state =
-  { state with indent_level = max 0 (state.indent_level - 1) }
+  state.indent_level := max 0 (!(state.indent_level) - 1)
 
-(* 生成表达式代码 *)
+(* 生成表达式代码（返回寄存器） *)
 let rec gen_expr state expr =
   match expr with
   | Literal (IntLit n) ->
@@ -121,203 +131,194 @@ let rec gen_expr state expr =
       emit_line state (Printf.sprintf "li %s, %d" (Register.to_string reg) n);
       reg
   | Var id ->
+      let offset = Hashtbl.find state.var_offsets id in
       let reg = Register.T0 in
-      emit_line state (Printf.sprintf "lw %s, %s(sp)" (Register.to_string reg) id);
+      emit_line state (Printf.sprintf "lw %s, %d(sp)" (Register.to_string reg) offset);
       reg
   | BinOp (e1, op, e2) ->
       let r1 = gen_expr state e1 in
       let r2 = gen_expr state e2 in
-      let op_code = match op with
-        | "+" -> "add"
-        | "-" -> "sub"
-        | "*" -> "mul"
-        | "/" -> "div"
-        | "%" -> "rem"
-        | "&&" -> "and"
-        | "||" -> "or"
-        | "==" -> "seqz"  (* 需要调整 *)
-        | "!=" -> "snez"  (* 需要调整 *)
-        | "<" -> "slt"
-        | ">" -> "sgt"    (* 不存在，需要调整 *)
-        | "<=" -> "sle"   (* 不存在，需要调整 *)
-        | ">=" -> "sge"   (* 不存在，需要调整 *)
-        | _ -> failwith ("Unsupported operator: " ^ op)
+      let emit_binop op_code =
+        emit_line state (Printf.sprintf "%s %s, %s, %s" 
+          op_code 
+          (Register.to_string r1) 
+          (Register.to_string r1) 
+          (Register.to_string r2))
       in
-      emit_line state (Printf.sprintf "%s %s, %s, %s" 
-        op_code 
-        (Register.to_string r1) 
-        (Register.to_string r1) 
-        (Register.to_string r2));
+      (match op with
+       | "+" -> emit_binop "add"
+       | "-" -> emit_binop "sub"
+       | "*" -> emit_binop "mul"
+       | "/" -> emit_binop "div"
+       | "%" -> emit_binop "rem"
+       | "&&" -> emit_binop "and"
+       | "||" -> emit_binop "or"
+       | "==" ->
+           emit_binop "sub";
+           emit_line state (Printf.sprintf "seqz %s, %s" (Register.to_string r1) (Register.to_string r1))
+       | "!=" ->
+           emit_binop "sub";
+           emit_line state (Printf.sprintf "snez %s, %s" (Register.to_string r1) (Register.to_string r1))
+       | "<" -> emit_binop "slt"
+       | ">" ->
+           emit_line state (Printf.sprintf "slt %s, %s, %s" 
+             (Register.to_string r1) 
+             (Register.to_string r2) 
+             (Register.to_string r1))
+       | "<=" ->
+           emit_line state (Printf.sprintf "slt %s, %s, %s" 
+             (Register.to_string r1) 
+             (Register.to_string r2) 
+             (Register.to_string r1));
+           emit_line state (Printf.sprintf "xori %s, %s, 1" 
+             (Register.to_string r1) (Register.to_string r1))
+       | ">=" ->
+           emit_binop "slt";
+           emit_line state (Printf.sprintf "xori %s, %s, 1" 
+             (Register.to_string r1) (Register.to_string r1))
+       | _ -> failwith ("Unsupported operator: " ^ op));
       r1
   | UnOp (op, e) ->
       let r = gen_expr state e in
-      let op_code = match op with
-        | "-" -> "neg"
-        | "!" -> "seqz"
-        | _ -> failwith ("Unsupported unary operator: " ^ op)
-      in
-      emit_line state (Printf.sprintf "%s %s, %s" 
-        op_code 
-        (Register.to_string r) 
-        (Register.to_string r));
+      (match op with
+       | "-" -> emit_line state (Printf.sprintf "neg %s, %s" (Register.to_string r) (Register.to_string r))
+       | "!" -> 
+           emit_line state (Printf.sprintf "seqz %s, %s" (Register.to_string r) (Register.to_string r));
+           emit_line state (Printf.sprintf "xori %s, %s, 1" (Register.to_string r) (Register.to_string r))
+       | "+" -> emit_line state (Printf.sprintf "mv %s, %s" (Register.to_string r) (Register.to_string r))
+       | _ -> failwith ("Unsupported unary operator: " ^ op));
       r
   | Call (fname, args) ->
-      (* 将参数放入适当的寄存器 *)
+      let num_args = List.length args in
+      let stack_args = if num_args > 8 then num_args - 8 else 0 in
+      let stack_size = stack_args * 4 in
+      if stack_size > 0 then
+        emit_line state (Printf.sprintf "addi sp, sp, -%d" stack_size);
       List.iteri (fun i arg ->
-        let reg = match i with
-          | 0 -> Register.A0
-          | 1 -> Register.A1
-          | 2 -> Register.A2
-          | 3 -> Register.A3
-          | 4 -> Register.A4
-          | 5 -> Register.A5
-          | 6 -> Register.A6
-          | 7 -> Register.A7
-          | _ -> failwith "Too many arguments"
-        in
         let arg_reg = gen_expr state arg in
-        emit_line state (Printf.sprintf "mv %s, %s" 
-          (Register.to_string reg) 
-          (Register.to_string arg_reg))
+        if i < 8 then
+          let dest_reg = match i with
+            | 0 -> Register.A0 | 1 -> Register.A1 | 2 -> Register.A2 | 3 -> Register.A3
+            | 4 -> Register.A4 | 5 -> Register.A5 | 6 -> Register.A6 | 7 -> Register.A7
+            | _ -> assert false
+          in
+          emit_line state (Printf.sprintf "mv %s, %s" 
+            (Register.to_string dest_reg) 
+            (Register.to_string arg_reg))
+        else
+          let offset = (i - 8) * 4 in
+          emit_line state (Printf.sprintf "sw %s, %d(sp)" 
+            (Register.to_string arg_reg) offset)
       ) args;
-      
-      (* 调用函数 *)
       emit_line state (Printf.sprintf "call %s" fname);
-      
-      (* 返回值在a0中 *)
+      if stack_size > 0 then
+        emit_line state (Printf.sprintf "addi sp, sp, %d" stack_size);
       Register.A0
   | Paren e ->
       gen_expr state e
 
-(* 生成语句代码 *)
+(* 生成语句代码（返回unit，直接修改状态） *)
 let rec gen_stmt state stmt =
   match stmt with
   | Block stmts ->
-      emit_line state "{  # block start";
-      let new_state = indent state in
-      List.iter (gen_stmt new_state) stmts;
-      emit_line (unindent new_state) "}  # block end"
+      indent state;  (* 进入块增加缩进 *)
+      List.iter (gen_stmt state) stmts;  (* 递归处理内部语句 *)
+      unindent state  (* 离开块减少缩进 *)
   | Empty ->
       emit_line state "nop"
   | ExprStmt expr ->
       ignore (gen_expr state expr)
   | Assign (id, expr) ->
+      let offset = Hashtbl.find state.var_offsets id in
       let reg = gen_expr state expr in
-      emit_line state (Printf.sprintf "sw %s, %s(sp)" 
-        (Register.to_string reg) id)
+      emit_line state (Printf.sprintf "sw %s, %d(sp)" 
+        (Register.to_string reg) offset)
   | Decl (id, expr) ->
+      let offset = Hashtbl.find state.var_offsets id in
       let reg = gen_expr state expr in
-      emit_line state (Printf.sprintf "sw %s, %s(sp)" 
-        (Register.to_string reg) id)
+      emit_line state (Printf.sprintf "sw %s, %d(sp)" 
+        (Register.to_string reg) offset)
   | If (cond, then_stmt, else_stmt_opt) ->
       let else_label = new_label state "else" in
       let end_label = new_label state "endif" in
-      
-      (* 计算条件表达式 *)
       let cond_reg = gen_expr state cond in
-      
-      (* 如果条件为假，跳转到else *)
       emit_line state (Printf.sprintf "beqz %s, %s" 
         (Register.to_string cond_reg) else_label);
-      
-      (* 生成then部分 *)
-      gen_stmt state then_stmt;
-      
-      (* 跳转到结束 *)
+      gen_stmt state then_stmt;  (* 处理then分支 *)
       emit_line state (Printf.sprintf "j %s" end_label);
-      
-      (* else标签 *)
       emit_line state (Printf.sprintf "%s:" else_label);
-      
-      (* 生成else部分（如果有） *)
-      Option.iter (gen_stmt state) else_stmt_opt;
-      
-      (* 结束标签 *)
+      (match else_stmt_opt with  (* 处理else分支 *)
+       | Some else_stmt -> gen_stmt state else_stmt
+       | None -> ());
       emit_line state (Printf.sprintf "%s:" end_label)
   | While (cond, body) ->
       let loop_label = new_label state "loop" in
       let cond_label = new_label state "cond" in
       let end_label = new_label state "endloop" in
-      
-      (* 跳转到条件检查 *)
+      let loop_info = { cond_label; end_label } in
+      state.loop_stack <- loop_info :: state.loop_stack;  (* 入栈循环信息 *)
       emit_line state (Printf.sprintf "j %s" cond_label);
-      
-      (* 循环体开始 *)
       emit_line state (Printf.sprintf "%s:" loop_label);
-      gen_stmt state body;
-      
-      (* 条件检查标签 *)
+      indent state;
+      gen_stmt state body;  (* 处理循环体 *)
+      unindent state;
       emit_line state (Printf.sprintf "%s:" cond_label);
       let cond_reg = gen_expr state cond in
-      
-      (* 如果条件为真，继续循环 *)
       emit_line state (Printf.sprintf "bnez %s, %s" 
         (Register.to_string cond_reg) loop_label);
-      
-      (* 结束标签 *)
-      emit_line state (Printf.sprintf "%s:" end_label)
+      emit_line state (Printf.sprintf "%s:" end_label);
+      state.loop_stack <- List.tl state.loop_stack  (* 出栈循环信息 *)
   | Break ->
-      failwith "Break not implemented"
+      (match state.loop_stack with
+       | [] -> failwith "Break outside loop"
+       | { end_label; _ } :: _ ->
+           emit_line state (Printf.sprintf "j %s" end_label))
   | Continue ->
-      failwith "Continue not implemented"
+      (match state.loop_stack with
+       | [] -> failwith "Continue outside loop"
+       | { cond_label; _ } :: _ ->
+           emit_line state (Printf.sprintf "j %s" cond_label))
   | Return expr_opt ->
-      begin match expr_opt with
-      | None ->
-          emit_line state "li a0, 0"  (* void函数返回0 *)
-      | Some expr ->
-          let reg = gen_expr state expr in
-          emit_line state (Printf.sprintf "mv a0, %s" (Register.to_string reg))
-      end;
+      (match expr_opt with
+       | None -> emit_line state "li a0, 0"
+       | Some expr -> 
+           let reg = gen_expr state expr in
+           emit_line state (Printf.sprintf "mv a0, %s" (Register.to_string reg)));
       emit_line state "ret"
 
 (* 生成函数代码 *)
-let gen_function state func =
-  (* 函数标签 *)
+let gen_function func =
+  let var_offsets = Hashtbl.create 16 in
+  (* 这里需要从语义分析获取变量偏移量，示例中临时填充 *)
+  (* 实际应替换为：Hashtbl.iter (fun k (_,o) -> Hashtbl.add var_offsets k o) func.var_offsets; *)
+  let state = create_state var_offsets in
   emit_line state (Printf.sprintf "%s:" func.fname);
-  
-  (* 保存调用者保存的寄存器 *)
   emit_line state "addi sp, sp, -16";
   emit_line state "sw ra, 12(sp)";
   emit_line state "sw s0, 8(sp)";
   emit_line state "sw s1, 4(sp)";
-  
-  (* 设置帧指针 *)
   emit_line state "mv s0, sp";
-  
-  (* 为局部变量分配空间 *)
-  let local_size = 4 * List.length (List.filter (function 
-    | Decl _ -> true 
-    | _ -> false) func.body) 
-  in
-  if local_size > 0 then begin
+  let local_size = 4 * Hashtbl.length var_offsets in
+  if local_size > 0 then
     emit_line state (Printf.sprintf "addi sp, sp, -%d" local_size);
-  end;
-  
-  (* 生成函数体 *)
-  List.iter (gen_stmt state) func.body;
-  
-  (* 恢复寄存器和栈指针 *)
-  if local_size > 0 then begin
+  List.iter (gen_stmt state) func.body;  (* 生成函数体 *)
+  if local_size > 0 then
     emit_line state (Printf.sprintf "addi sp, sp, %d" local_size);
-  end;
   emit_line state "lw ra, 12(sp)";
   emit_line state "lw s0, 8(sp)";
   emit_line state "lw s1, 4(sp)";
   emit_line state "addi sp, sp, 16";
-  
-  (* 返回指令 *)
-  emit_line state "ret"
+  emit_line state "ret";
+  Buffer.contents state.output
 
 (* 生成程序代码 *)
 let gen_program program =
-  let state = create_state () in
-  
-  (* 输出文件头 *)
-  emit_line state ".text";
-  emit_line state ".globl main";
-  
-  (* 生成每个函数 *)
-  List.iter (gen_function state) program;
-  
-  (* 返回生成的汇编代码 *)
-  Buffer.contents state.output  
+  let buffer = Buffer.create 4096 in
+  Buffer.add_string buffer ".text\n";
+  Buffer.add_string buffer ".globl main\n";
+  List.iter (fun func ->
+    let func_asm = gen_function func in
+    Buffer.add_string buffer func_asm;
+    Buffer.add_char buffer '\n'
+  ) program;
+  Buffer.contents buffer
