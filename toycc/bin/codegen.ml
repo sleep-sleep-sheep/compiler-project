@@ -80,6 +80,7 @@ type state = {
   indent_level: int;
   local_vars: (string * int) list;  (* 变量名到栈偏移的映射 *)
   mutable next_offset: int;         (* 下一个可用的栈偏移量 *)
+  function_params: (string * int) list;  (* 函数参数映射 *)
 }
 
 (* 创建新的生成器状态 *)
@@ -89,13 +90,15 @@ let create_state () = {
   indent_level = 0;
   local_vars = [];
   next_offset = 0;
+  function_params = [];
 }
 
 (* 复制状态并更新变量和偏移量 *)
-let update_state state vars offset = {
+let update_state state vars offset params = {
   state with
   local_vars = vars;
   next_offset = offset;
+  function_params = params;
 }
 
 (* 生成新的标签 *)
@@ -124,18 +127,33 @@ let indent state =
 let unindent state =
   { state with indent_level = max 0 (state.indent_level - 1) }
 
-(* 查找变量的栈偏移 *)
+(* 查找变量的栈偏移 - 先查局部变量，再查参数 *)
 let find_var_offset state var =
   match List.assoc_opt var state.local_vars with
   | Some offset -> offset
-  | None -> failwith ("Undefined variable: " ^ var)
+  | None ->
+      match List.assoc_opt var state.function_params with
+      | Some offset -> offset
+      | None -> failwith ("Undefined variable: " ^ var)
 
 (* 为新变量分配栈空间 *)
 let allocate_var state var =
   let offset = state.next_offset in
   let new_vars = (var, offset) :: state.local_vars in
-  let new_state = update_state state new_vars (offset + 4) in
+  let new_state = update_state state new_vars (offset + 4) state.function_params in
   (new_state, offset)
+
+(* 为函数参数分配空间 *)
+let allocate_params state params =
+  let rec alloc_params params offset acc =
+    match params with
+    | [] -> (acc, offset)
+    | param :: rest ->
+        alloc_params rest (offset + 4) ((param, offset) :: acc)
+  in
+  let (param_map, new_offset) = alloc_params params 0 [] in
+  let new_state = update_state state state.local_vars new_offset param_map in
+  new_state
 
 (* 加载立即数到寄存器（不使用伪指令） *)
 let load_imm state reg value =
@@ -421,8 +439,11 @@ let gen_function state func =
   (* 设置帧指针 *)
   emit_line state "add s0, sp, x0";
   
+  (* 分配函数参数 *)
+  let param_state = allocate_params state func.params in
+  
   (* 初始化局部变量状态 *)
-  let local_state = { state with local_vars = []; next_offset = 16 } in
+  let local_state = { param_state with next_offset = 16 } in
   
   (* 计算所需的栈空间 *)
   let temp_state = List.fold_left (fun s st -> gen_stmt s st) local_state func.body in
