@@ -387,35 +387,44 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     result_reg, instrs
   | Ast.Call (fname, args) ->
     let result_reg = A0 in
-    (* 保存临时寄存器 *)
-    let save_instrs = [
-      Addi (Sp, Sp, -28);
-      Sw (T0, 0, Sp);
-      Sw (T1, 4, Sp);
-      Sw (T2, 8, Sp);
-      Sw (T3, 12, Sp);
-      Sw (T4, 16, Sp);
-      Sw (T5, 20, Sp);
-      Sw (T6, 24, Sp);
-    ] in
+    let num_args = List.length args in
+    (* 计算需要栈传递的参数数量 *)
+    let num_stack_args = max 0 (num_args - 8) in
+    (* 计算需要的栈空间 (每个参数4字节) + 保存临时寄存器的空间 *)
+    let stack_needed = num_stack_args * 4 + 28 in
+    (* 保存临时寄存器和为栈参数分配空间 *)
+    let save_instrs = 
+      if stack_needed > 0 then
+        Addi (Sp, Sp, -stack_needed) ::
+        [ Sw (T0, num_stack_args * 4 + 0, Sp);
+          Sw (T1, num_stack_args * 4 + 4, Sp);
+          Sw (T2, num_stack_args * 4 + 8, Sp);
+          Sw (T3, num_stack_args * 4 + 12, Sp);
+          Sw (T4, num_stack_args * 4 + 16, Sp);
+          Sw (T5, num_stack_args * 4 + 20, Sp);
+          Sw (T6, num_stack_args * 4 + 24, Sp);
+        ]
+      else
+        []
+    in
     (* 处理参数 *)
     let arg_instrs =
       List.mapi
         (fun i arg ->
            let arg_reg, arg_code = gen_expr ctx arg in
-           let target_reg =
-             match i with
-             | 0 -> A0
-             | 1 -> A1
-             | 2 -> A2
-             | 3 -> A3
-             | 4 -> A4
-             | 5 -> A5
-             | 6 -> A6
-             | 7 -> A7
-             | _ -> failwith "Too many arguments (max 8)"
+           let instrs =
+             if i < 8 then  (* 前8个参数使用寄存器传递 *)
+               let target_reg =
+                 match i with
+                 | 0 -> A0 | 1 -> A1 | 2 -> A2 | 3 -> A3
+                 | 4 -> A4 | 5 -> A5 | 6 -> A6 | 7 -> A7
+                 | _ -> failwith "Invalid register index"
+               in
+               arg_code @ [ Mv (target_reg, arg_reg) ]
+             else  (* 超过8个的参数使用栈传递 *)
+               let stack_pos = (i - 8) * 4 in  (* 栈上的位置 *)
+               arg_code @ [ Sw (arg_reg, stack_pos, Sp) ]
            in
-           let instrs = arg_code @ [ Mv (target_reg, arg_reg) ] in
            release_temp_reg ctx;  (* 释放arg_reg *)
            instrs)
         args
@@ -423,17 +432,21 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     in
     (* 函数调用 *)
     let call_instr = [ Jal (Ra, fname) ] in
-    (* 恢复临时寄存器 *)
-    let restore_instrs = [
-      Lw (T0, 0, Sp);
-      Lw (T1, 4, Sp);
-      Lw (T2, 8, Sp);
-      Lw (T3, 12, Sp);
-      Lw (T4, 16, Sp);
-      Lw (T5, 20, Sp);
-      Lw (T6, 24, Sp);
-      Addi (Sp, Sp, 28);
-    ] in
+    (* 恢复临时寄存器和栈空间 *)
+    let restore_instrs =
+      if stack_needed > 0 then
+        [ Lw (T0, num_stack_args * 4 + 0, Sp);
+          Lw (T1, num_stack_args * 4 + 4, Sp);
+          Lw (T2, num_stack_args * 4 + 8, Sp);
+          Lw (T3, num_stack_args * 4 + 12, Sp);
+          Lw (T4, num_stack_args * 4 + 16, Sp);
+          Lw (T5, num_stack_args * 4 + 20, Sp);
+          Lw (T6, num_stack_args * 4 + 24, Sp);
+          Addi (Sp, Sp, stack_needed)
+        ]
+      else
+        []
+    in
     result_reg, save_instrs @ arg_instrs @ call_instr @ restore_instrs   
 
 
@@ -554,24 +567,26 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
   (* 函数序言 *)
   let prologue = gen_prologue_instrs frame_size  in
   
-  (* 处理参数 - 将参数从寄存器保存到栈中 *)
+  (* 处理参数 - 将参数从寄存器/栈保存到栈帧中 *)
   let param_instrs =
     List.mapi
       (fun i { Ast.pname = name; _ } ->
        let offset = get_var_offset ctx name in  (* 使用已注册的变量偏移 *)
-       let arg_reg =
-         match i with
-         | 0 -> A0
-         | 1 -> A1
-         | 2 -> A2
-         | 3 -> A3
-         | 4 -> A4
-         | 5 -> A5
-         | 6 -> A6
-         | 7 -> A7
-         | _ -> failwith "Too many parameters (max 8)"
+       let instrs =
+         if i < 8 then  (* 前8个参数从寄存器获取 *)
+           let arg_reg =
+             match i with
+             | 0 -> A0 | 1 -> A1 | 2 -> A2 | 3 -> A3
+             | 4 -> A4 | 5 -> A5 | 6 -> A6 | 7 -> A7
+             | _ -> failwith "Invalid register index"
+           in
+           [ Instruction (Sw (arg_reg, offset, Fp)) ]
+         else  (* 超过8个的参数从栈获取 *)
+           let stack_offset = (i - 8) * 4 + 16 in  (* 栈上的位置 (ra和fp占用8字节) *)
+           [ Instruction (Lw (T0, stack_offset, Sp));
+             Instruction (Sw (T0, offset, Fp)) ]
        in
-       [ Instruction (Sw (arg_reg, offset, Fp)) ])
+       instrs)
       func_def.params
     |> List.flatten
   in
