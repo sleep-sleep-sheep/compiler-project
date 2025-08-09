@@ -35,7 +35,6 @@ type reg =
   | T5 
   | T6 
 
-
 (* 将寄存器转换为字符串 *)
 let reg_to_string reg = 
   match reg with
@@ -71,7 +70,6 @@ let reg_to_string reg =
   | T4 -> "t4"
   | T5 -> "t5"
   | T6 -> "t6"
-
 
 (* RISC-V 指令类型 *)
 type instruction =
@@ -114,7 +112,6 @@ type instruction =
   | Mv of reg * reg (* mv rd, rs - 伪指令 *)
   (* 其他 *)
   | Nop (* nop *)
-
 
 (* 将指令转换为汇编字符串 *)
 let instr_to_string instr = match instr with
@@ -202,7 +199,6 @@ let instr_to_string instr = match instr with
   | Mv (rd, rs) -> Printf.sprintf "mv %s, %s" (reg_to_string rd) (reg_to_string rs)
   | Nop -> "nop"
 
-
 (* 标签 *)
 type label = string
 
@@ -213,14 +209,12 @@ type asm_item =
   | Comment of string
   | Directive of string
 
-
 (* 将汇编项转换为字符串 *)
 let asm_item_to_string item = match item with 
   | Instruction instr -> "    " ^ instr_to_string instr
   | Label l -> l ^ ":"
   | Directive d -> "    " ^ d
   | Comment c -> "    # " ^ c
-
 
 (* 输出汇编代码到文件 *)
 let emit_asm_to_file filepath asm_items =
@@ -232,14 +226,12 @@ let emit_asm_to_file filepath asm_items =
     asm_items;
   close_out file
 
-
 (* 输出汇编代码到标准输出 *)
 let emit_asm_to_stdout asm_items =
   List.iter
     (fun item ->
        print_endline (asm_item_to_string item))
     asm_items
-
 
 (* 代码生成上下文 *)
 type codegen_context =
@@ -251,24 +243,21 @@ type codegen_context =
   ; mutable local_vars : (string * int) list (* 局部变量映射到栈偏移 *)
   }
 
-
 (* 创建新的代码生成上下文 *)
 let create_context () =
   { label_counter = 0;
     temp_counter = 0;
-    stack_offset = -8; (* fp-based offset, starts from 0 and goes down *)
+    stack_offset = 0;  (* 修复：从0开始计算栈偏移 *)
     break_labels = [];
     continue_labels = [];
     local_vars = []
   }
-
 
 (* 生成新标签 *)
 let new_label ctx prefix =
   let label = Printf.sprintf "%s%d" prefix ctx.label_counter in
   ctx.label_counter <- ctx.label_counter + 1;
   label
-
 
 (* 获取临时寄存器 *)
 let get_temp_reg ctx =
@@ -287,19 +276,16 @@ let get_temp_reg ctx =
   ctx.temp_counter <- ctx.temp_counter + 1;
   reg
 
-
 (* 释放临时寄存器 *)
 let release_temp_reg ctx =
   if ctx.temp_counter > 0 then
     ctx.temp_counter <- ctx.temp_counter - 1
 
-
 (* 将变量添加到栈中 *)
 let add_local_var ctx name =
-  ctx.stack_offset <- ctx.stack_offset - 4;
+  ctx.stack_offset <- ctx.stack_offset - 4;  (* 每个变量4字节，向下增长 *)
   ctx.local_vars <- (name, ctx.stack_offset) :: ctx.local_vars;
   ctx.stack_offset
-
 
 (* 获取变量的栈偏移 *)
 let get_var_offset ctx name =
@@ -309,7 +295,6 @@ let get_var_offset ctx name =
       failwith (Printf.sprintf "Variable '%s' not found in scope (available: %s)"
         name 
         (String.concat ", " (List.map fst ctx.local_vars)))
-
 
 (* 预扫描函数以收集所有变量声明和参数 *)
 let pre_scan_function func_def =
@@ -333,7 +318,6 @@ let pre_scan_function func_def =
   (* 合并参数和局部变量，参数在前 *)
   param_names @ local_vars
 
-
 (* 生成表达式代码，返回结果寄存器和指令列表 *)
 let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
   match expr with
@@ -344,7 +328,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
   | Ast.Var id ->
     let reg = get_temp_reg ctx in
     let offset = get_var_offset ctx id in
-    let instr = [ Lw (reg, offset, Fp) ] in
+    let instr = [ Lw (reg, offset, Fp) ] in  (* 使用fp作为基地址访问变量 *)
     reg, instr
   | Ast.Paren e -> gen_expr ctx e
   | Ast.UnOp (op, e) ->
@@ -449,24 +433,21 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     in
     result_reg, save_instrs @ arg_instrs @ call_instr @ restore_instrs   
 
-
 (* 生成序言 *)
 let gen_prologue_instrs frame_size =
-  [ Instruction(Addi (Sp, Sp, -frame_size));
-    Instruction(Sw (Ra, frame_size - 4, Sp));
-    Instruction(Sw (Fp, frame_size - 8, Sp));
-    Instruction(Addi (Fp, Sp, frame_size))
+  [ Instruction(Addi (Sp, Sp, -frame_size));  (* 分配栈帧空间 *)
+    Instruction(Sw (Ra, frame_size - 4, Sp));  (* 保存返回地址 *)
+    Instruction(Sw (Fp, frame_size - 8, Sp));  (* 保存旧帧指针 *)
+    Instruction(Addi (Fp, Sp, frame_size))     (* 设置新帧指针 *)
   ]
-
 
 (* 生成尾声 *)
 let gen_epilogue_instrs frame_size =
-  [ Lw (Ra, frame_size - 4, Sp);
-    Lw (Fp, frame_size - 8, Sp); 
-    Addi (Sp, Sp, frame_size);
-    Ret
+  [ Lw (Ra, frame_size - 4, Sp);  (* 恢复返回地址 *)
+    Lw (Fp, frame_size - 8, Sp);  (* 恢复帧指针 *)
+    Addi (Sp, Sp, frame_size);    (* 释放栈帧空间 *)
+    Ret                           (* 返回 *)
   ]
-
 
 (* 生成语句代码 *)
 let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
@@ -533,16 +514,15 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
   | Ast.Decl (name, e) ->
     let offset = add_local_var ctx name in
     let e_reg, e_instrs = gen_expr ctx e in
-    let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in
+    let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in  (* 存储到基于fp的偏移处 *)
     release_temp_reg ctx;  (* 释放e_reg *)
     List.map (fun i -> Instruction i) all_instrs
   | Ast.Assign (name, e) ->
     let offset = get_var_offset ctx name in
     let e_reg, e_instrs = gen_expr ctx e in
-    let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in
+    let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in  (* 存储到基于fp的偏移处 *)
     release_temp_reg ctx;  (* 释放e_reg *)
     List.map (fun i -> Instruction i) all_instrs
-
 
 (* 计算函数所需的栈帧大小 *)
 let calculate_frame_size (func_def : Ast.func_def) =
@@ -553,7 +533,6 @@ let calculate_frame_size (func_def : Ast.func_def) =
   let required_space = 8 + (num_vars * 4) in
   (* 对齐到16字节 *)
   (required_space + 15) / 16 * 16
-
 
 (* 生成函数代码 *)
 let gen_function (func_def : Ast.func_def) : asm_item list =
@@ -580,11 +559,11 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
              | 4 -> A4 | 5 -> A5 | 6 -> A6 | 7 -> A7
              | _ -> failwith "Invalid register index"
            in
-           [ Instruction (Sw (arg_reg, offset, Fp)) ]
+           [ Instruction (Sw (arg_reg, offset, Fp)) ]  (* 保存到基于fp的偏移处 *)
          else  (* 超过8个的参数从栈获取 *)
            let stack_offset = (i - 8) * 4 + 16 in  (* 栈上的位置 (ra和fp占用8字节) *)
            [ Instruction (Lw (T0, stack_offset, Sp));
-             Instruction (Sw (T0, offset, Fp)) ]
+             Instruction (Sw (T0, offset, Fp)) ]  (* 保存到基于fp的偏移处 *)
        in
        instrs)
       func_def.params
@@ -592,7 +571,7 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
   in
   
   (* 重置栈偏移，准备生成代码 *)
-  ctx.stack_offset <- -8;
+  ctx.stack_offset <- 0;  (* 修复：重置为0而不是-8 *)
   ctx.local_vars <- [];
   List.iter (fun var -> ignore (add_local_var ctx var)) all_vars;
   
@@ -619,7 +598,6 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
   
   prologue @ param_instrs @ body_items @ epilogue
 
-
 (* 生成整个程序的代码 *)
 let gen_program (program : Ast.program) =
   (* 全局声明 *)
@@ -641,11 +619,9 @@ let gen_program (program : Ast.program) =
   (* 转换为字符串输出 *)
   String.concat "\n" (List.map asm_item_to_string (header @ func_asm_items))
 
-
 (* 主入口函数：编译程序并输出汇编文件 *)
 let compile_to_riscv program output_file =
   let asm_code = gen_program program in
   let file = open_out output_file in
   output_string file asm_code;
   close_out file
-    
