@@ -294,19 +294,6 @@ let release_temp_reg ctx =
     ctx.temp_counter <- ctx.temp_counter - 1
 
 
-(* 保存当前上下文变量并创建新的作用域 *)
-let push_scope ctx =
-  let saved_vars = ctx.local_vars in
-  let saved_offset = ctx.stack_offset in
-  (saved_vars, saved_offset)
-
-
-(* 恢复之前的上下文变量，退出当前作用域 *)
-let pop_scope ctx (saved_vars, saved_offset) =
-  ctx.local_vars <- saved_vars;
-  ctx.stack_offset <- saved_offset
-
-
 (* 将变量添加到栈中 *)
 let add_local_var ctx name =
   ctx.stack_offset <- ctx.stack_offset - 4;
@@ -489,16 +476,18 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     let _, instrs = gen_expr ctx e in
     List.map (fun i -> Instruction i) instrs
   | Ast.Block stmts ->
-    (* 块内声明的变量有独立的作用域 *)
-    let saved_scope = push_scope ctx in
-    let items = List.map (gen_stmt ctx frame_size) stmts |> List.flatten in
-    let _ = pop_scope ctx saved_scope in
-    items
+    (* 块内声明的变量在整个函数可见 *)
+    List.map (gen_stmt ctx frame_size) stmts |> List.flatten
   | Ast.Return (Some e) ->
-    let e_reg, e_instrs = gen_expr ctx e in
-    let all_instrs = e_instrs @ [ Mv (A0, e_reg) ] @ gen_epilogue_instrs frame_size in
-    release_temp_reg ctx;  (* 释放e_reg *)
-    List.map (fun i -> Instruction i) all_instrs
+    (match e with
+     | Ast.Literal(IntLit 0) ->
+       let all_instrs = [ Li (A0, 0) ] @ gen_epilogue_instrs frame_size in
+       List.map (fun i -> Instruction i) all_instrs
+     | _ ->
+       let e_reg, e_instrs = gen_expr ctx e in
+       let all_instrs = e_instrs @ [ Mv (A0, e_reg) ] @ gen_epilogue_instrs frame_size in
+       release_temp_reg ctx;  (* 释放e_reg *)
+       List.map (fun i -> Instruction i) all_instrs)
   | Ast.Return None -> 
       List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
   | Ast.If (cond, then_stmt, else_stmt) ->
