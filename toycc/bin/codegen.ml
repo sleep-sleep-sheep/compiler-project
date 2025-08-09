@@ -256,7 +256,7 @@ type codegen_context =
 let create_context () =
   { label_counter = 0;
     temp_counter = 0;
-    stack_offset = -4; (* 修复栈偏移初始值 *)
+    stack_offset = -8; (* fp-based offset, starts from 0 and goes down *)
     break_labels = [];
     continue_labels = [];
     local_vars = []
@@ -292,6 +292,19 @@ let get_temp_reg ctx =
 let release_temp_reg ctx =
   if ctx.temp_counter > 0 then
     ctx.temp_counter <- ctx.temp_counter - 1
+
+
+(* 保存当前上下文变量并创建新的作用域 *)
+let push_scope ctx =
+  let saved_vars = ctx.local_vars in
+  let saved_offset = ctx.stack_offset in
+  (saved_vars, saved_offset)
+
+
+(* 恢复之前的上下文变量，退出当前作用域 *)
+let pop_scope ctx (saved_vars, saved_offset) =
+  ctx.local_vars <- saved_vars;
+  ctx.stack_offset <- saved_offset
 
 
 (* 将变量添加到栈中 *)
@@ -476,27 +489,18 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     let _, instrs = gen_expr ctx e in
     List.map (fun i -> Instruction i) instrs
   | Ast.Block stmts ->
-    (* 保存当前局部变量上下文 *)
-    let saved_vars = ctx.local_vars in
-    let saved_offset = ctx.stack_offset in
-    
-    (* 处理块内语句 *)
-    let block_items = List.map (gen_stmt ctx frame_size) stmts |> List.flatten in
-    
-    (* 恢复局部变量上下文 - 修复作用域问题 *)
-    ctx.local_vars <- saved_vars;
-    ctx.stack_offset <- saved_offset;
-    
-    block_items
+    (* 块内声明的变量有独立的作用域 *)
+    let saved_scope = push_scope ctx in
+    let items = List.map (gen_stmt ctx frame_size) stmts |> List.flatten in
+    let _ = pop_scope ctx saved_scope in
+    items
   | Ast.Return (Some e) ->
     let e_reg, e_instrs = gen_expr ctx e in
     let all_instrs = e_instrs @ [ Mv (A0, e_reg) ] @ gen_epilogue_instrs frame_size in
     release_temp_reg ctx;  (* 释放e_reg *)
     List.map (fun i -> Instruction i) all_instrs
   | Ast.Return None -> 
-      (* 默认返回0 *)
-      let all_instrs = [ Li (A0, 0) ] @ gen_epilogue_instrs frame_size in
-      List.map (fun i -> Instruction i) all_instrs
+      List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
   | Ast.If (cond, then_stmt, else_stmt) ->
     let cond_reg, cond_instrs = gen_expr ctx cond in
     let else_label = new_label ctx "else" in
@@ -606,7 +610,7 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
   (* 函数体 *)
   let body_items =
     func_def.body
-    |> List.map (fun stmt -> gen_stmt ctx frame_size stmt)
+    |> List.map (gen_stmt ctx frame_size)
     |> List.flatten
   in
   
@@ -621,7 +625,7 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
     in
     if has_ret
     then []
-    else [ Instruction (Li (A0, 0)) ] @ List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
+    else List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
   in
   
   prologue @ param_instrs @ body_items @ epilogue
@@ -655,3 +659,4 @@ let compile_to_riscv program output_file =
   let file = open_out output_file in
   output_string file asm_code;
   close_out file
+    
