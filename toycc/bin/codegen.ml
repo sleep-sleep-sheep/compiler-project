@@ -141,18 +141,18 @@ let asm_item_to_string = function
 type codegen_context = {
   mutable label_counter: int;
   mutable temp_counter: int;
-  mutable stack_offset: int;
+  mutable var_count: int;  (* 改用变量计数，而非直接计算偏移 *)
   mutable break_labels: string list;
   mutable continue_labels: string list;
-  mutable local_vars: (string * int) list;
+  mutable local_vars: (string * int) list;  (* 变量名 -> 索引，从0开始 *)
 }
 
 
-(* 创建新的代码生成上下文 *)
+(* 创建新的代码生成上下文 - 全新模型 *)
 let create_context () = {
   label_counter = 0;
   temp_counter = 0;
-  stack_offset = -4;  (* 从-4开始，第一个变量位于-4(fp) *)
+  var_count = 0;  (* 从0开始计数变量 *)
   break_labels = [];
   continue_labels = [];
   local_vars = [];
@@ -181,17 +181,23 @@ let release_temp_reg ctx =
   if ctx.temp_counter > 0 then ctx.temp_counter <- ctx.temp_counter - 1
 
 
-(* 添加局部变量到栈 *)
+(* 添加局部变量到栈 - 全新计算方式 *)
 let add_local_var ctx name =
-  ctx.stack_offset <- ctx.stack_offset - 4;
-  ctx.local_vars <- (name, ctx.stack_offset) :: ctx.local_vars;
-  ctx.stack_offset
+  let index = ctx.var_count in
+  ctx.var_count <- ctx.var_count + 1;
+  ctx.local_vars <- (name, index) :: ctx.local_vars;
+  index  (* 返回变量索引，而非直接偏移 *)
 
 
-(* 获取变量的栈偏移 *)
+(* 获取变量的栈偏移 - 核心修复：根据索引计算实际偏移 *)
 let get_var_offset ctx name =
   match List.assoc_opt name ctx.local_vars with
-  | Some offset -> offset
+  | Some index -> 
+    (* 计算实际偏移：-4 - (index * 4) 
+       第一个变量(index=0) -> -4(fp)
+       第二个变量(index=1) -> -8(fp)
+       以此类推 *)
+    -4 - (index * 4)
   | None -> failwith (Printf.sprintf "Variable %s not found" name)
 
 
@@ -220,7 +226,7 @@ let rec gen_expr ctx = function
   
   | Var id ->
     let reg = get_temp_reg ctx in
-    let offset = get_var_offset ctx id in
+    let offset = get_var_offset ctx id in  (* 这里获取计算后的实际偏移 *)
     reg, [ Lw (reg, offset, Fp) ]
   
   | Paren e -> gen_expr ctx e
@@ -233,7 +239,7 @@ let rec gen_expr ctx = function
       | "!" -> e_instrs @ [ Sltiu (res_reg, e_reg, 1) ]
       | _ -> failwith ("Unknown unary operator: " ^ op)
     in
-    release_temp_reg ctx;  (* 释放e_reg *)
+    release_temp_reg ctx;
     res_reg, instrs
   
   | BinOp (e1, op, e2) ->
@@ -256,15 +262,15 @@ let rec gen_expr ctx = function
       | "||" -> [ Or (res, r1, r2); Sltu (res, Zero, res) ]
       | _ -> failwith ("Unknown binary operator: " ^ op)
     in
-    release_temp_reg ctx;  (* 释放r1 *)
-    release_temp_reg ctx;  (* 释放r2 *)
+    release_temp_reg ctx;
+    release_temp_reg ctx;
     res, i1 @ i2 @ ops
   
   | Call (fname, args) ->
     let result_reg = A0 in
     let num_args = List.length args in
     let num_stack_args = max 0 (num_args - 8) in
-    let stack_needed = num_stack_args * 4 + 28 in  (* 临时寄存器保存空间 *)
+    let stack_needed = num_stack_args * 4 + 28 in
     
     let save_instrs = if stack_needed > 0 then
       Addi (Sp, Sp, -stack_needed) ::
@@ -393,14 +399,16 @@ let rec gen_stmt ctx frame_size = function
      | [] -> failwith "Continue outside loop")
   
   | Decl (name, e) ->
-    let offset = add_local_var ctx name in
+    (* 移除未使用的index变量，直接调用add_local_var而不绑定结果 *)
+    ignore (add_local_var ctx name);
+    let offset = get_var_offset ctx name in  (* 获取计算后的实际偏移 *)
     let reg, instrs = gen_expr ctx e in
     let all_instrs = instrs @ [ Sw (reg, offset, Fp) ] in
     release_temp_reg ctx;
     List.map (fun i -> Instruction i) all_instrs
   
   | Assign (name, e) ->
-    let offset = get_var_offset ctx name in
+    let offset = get_var_offset ctx name in  (* 获取计算后的实际偏移 *)
     let reg, instrs = gen_expr ctx e in
     let all_instrs = instrs @ [ Sw (reg, offset, Fp) ] in
     release_temp_reg ctx;
@@ -412,7 +420,8 @@ let calculate_frame_size func_def =
   let all_vars = pre_scan_function func_def in
   let num_vars = List.length all_vars in
   let required = 8 + (num_vars * 4) in  (* 8字节用于ra和fp *)
-  (required + 15) / 16 * 16  (* 16字节对齐 *)
+  (* 16字节对齐 *)
+  if required mod 16 = 0 then required else (required / 16 + 1) * 16
 
 
 (* 生成函数代码 *)
@@ -446,7 +455,7 @@ let gen_function func_def =
     |> List.flatten in
   
   (* 重置上下文准备生成代码 *)
-  ctx.stack_offset <- -4;  (* 关键修复：从-4开始 *)
+  ctx.var_count <- 0;  (* 重置变量计数器 *)
   ctx.local_vars <- [];
   List.iter (fun var -> ignore (add_local_var ctx var)) all_vars;
   
