@@ -263,24 +263,26 @@ type codegen_context =
   ; mutable continue_labels : string list (* continue 跳转标签栈 *)
   ; mutable local_vars : (string * int) list (* 局部变量映射到栈偏移 *)
   ; mutable used_regs : reg list (* 跟踪已使用的寄存器 *)
+  ; func_name : string (* 函数名，用于生成唯一标签 *)
   }
 
 
 (* 创建新的代码生成上下文 *)
-let create_context _symbol_table =
+let create_context _symbol_table func_name =
   { label_counter = 0;
     temp_counter = 0;    
     stack_offset = -8 ;(* 基于S0的偏移，从0开始向下增长 *)
     break_labels = [];
     continue_labels = [];
     local_vars = [];
-    used_regs = []  (* 初始化空的已使用寄存器列表 *)
+    used_regs = [];  (* 初始化空的已使用寄存器列表 *)
+    func_name = func_name  (* 存储当前函数名 *)
   }
 
 
-(* 生成新标签 *)
+(* 生成新标签 - 关键修改：使用函数名作为前缀确保标签唯一性 *)
 let new_label ctx prefix =
-  let label = Printf.sprintf "%s%d" prefix ctx.label_counter in
+  let label = Printf.sprintf "%s_%s%d" ctx.func_name prefix ctx.label_counter in
   ctx.label_counter <- ctx.label_counter + 1;
   label
 
@@ -600,7 +602,8 @@ let calculate_frame_size (func_def : Ast.func_def) =
 
 (* 生成函数代码 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
-  let ctx = create_context symbol_table in
+  (* 创建上下文时传入函数名，用于生成唯一标签 *)
+  let ctx = create_context symbol_table func_def.fname in
   (* 计算栈帧 *)
   let frame_size = calculate_frame_size func_def in
   (* 函数序言 *)
@@ -678,6 +681,7 @@ let compile_to_riscv symbol_table program =
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
 
 
