@@ -671,7 +671,9 @@ let gen_program symbol_table (program : Ast.program) =
   header @ func_asm_items
 
 
-(* 主入口函数：编译程序并输出汇编文件 *)
-let compile_to_riscv symbol_table program output_file =
+let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
-  emit_asm_to_file output_file asm_items
+  (* 直接将汇编项转换为字符串并打印到标准输出 *)
+  List.iter
+    (fun item -> print_endline (asm_item_to_string item))
+    asm_items
