@@ -367,6 +367,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let (result_reg, spill_instrs) = get_temp_reg ctx in
     let instrs =
       match op with
+      | "+" -> [ Mv (result_reg, e_reg)]
       | "-" -> [ Sub (result_reg, Zero, e_reg) ]
       | "!" -> [ Sltiu (result_reg, e_reg, 1) ]
       | _ -> failwith (Printf.sprintf "Unknown unary operator: %s" op)
@@ -681,6 +682,7 @@ let compile_to_riscv symbol_table program =
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
 
 
