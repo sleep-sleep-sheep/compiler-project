@@ -1,3 +1,6 @@
+open Ast
+
+
 (* RISC-V 32位寄存器 *)
 type reg =
   | Zero 
@@ -277,17 +280,17 @@ let create_context _symbol_table func_name =
   }
 
 
-(* 生成新标签 - 使用函数名作为前缀确保标签唯一性 *)
+(* 生成新标签 - 关键修改：使用函数名作为前缀确保标签唯一性 *)
 let new_label ctx prefix =
   let label = Printf.sprintf "%s_%s%d" ctx.func_name prefix ctx.label_counter in
   ctx.label_counter <- ctx.label_counter + 1;
   label
 
 
-(* 获取临时寄存器 *)
+(* 获取临时寄存器 - 改进版 *)
 let get_temp_reg ctx =
-  (* 可用的临时寄存器列表 *)
-  let temp_regs = [T0; T1; T2; T3; T4; T5; T6] in
+  (* 可用的临时寄存器列表，包括S0作为额外的临时寄存器 *)
+  let temp_regs = [T0; T1; T2; T3; T4; T5; T6; S0] in
   
   (* 寻找第一个未使用的寄存器 *)
   let rec find_unused_reg regs =
@@ -408,8 +411,8 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let stack_args = if num_args > 8 then num_args - 8 else 0 in
     let stack_arg_size = stack_args * 4 in
     
-    (* 计算需要保存的寄存器 - 只保存s寄存器，t寄存器可以被调用者破坏 *)
-    let save_regs = [S0; S1; S2; S3; S4; S5; S6; S7; S8; S9; S10; S11] in
+    (* 计算需要保存的寄存器 *)
+    let save_regs = [T0; T1; T2; T3; T4; T5; T6; S0; S1; S2; S3; S4; S5; S6; S7; S8; S9; S10; S11] in
     let num_save_regs = List.length save_regs in
     let save_regs_size = num_save_regs * 4 in
     
@@ -417,7 +420,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let stack_alloc_size = stack_arg_size + save_regs_size in
     let stack_alloc_instr = if stack_alloc_size > 0 then [Addi (Sp, Sp, -stack_alloc_size)] else [] in
     
-    (* 保存寄存器 - 先移动栈指针，再保存寄存器 *)
+    (* 保存寄存器 *)
     let save_instrs = 
       List.mapi (fun i reg -> 
         Sw (reg, i * 4, Sp)
@@ -454,7 +457,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     (* 函数调用 *)
     let call_instr = [ Jal (Ra, fname) ] in
     
-    (* 恢复寄存器 - 先恢复寄存器，再释放栈空间 *)
+    (* 恢复寄存器 *)
     let restore_instrs = 
       List.mapi (fun i reg -> 
         Lw (reg, i * 4, Sp)
@@ -470,7 +473,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
 (* 生成序言 *)
 let gen_prologue_instrs frame_size =
   [ Instruction(Addi (Sp, Sp, -frame_size));
-    Instruction(Sw (Ra, frame_size - 4, Sp));  (* 保存返回地址 *)
+    Instruction(Sw (Ra, frame_size - 4, Sp));
     Instruction(Sw (S0, frame_size - 8, Sp));  (* 保存S0寄存器(帧指针) *)
     Instruction(Sw (S1, frame_size - 12, Sp)); (* 保存S1寄存器 *)
     Instruction(Addi (S0, Sp, frame_size))    (* 设置S0作为帧指针 *)
@@ -478,11 +481,11 @@ let gen_prologue_instrs frame_size =
 
 (* 生成尾声 *)
 let gen_epilogue_instrs frame_size =
-  [ Lw (Ra, frame_size - 4, Sp);  (* 恢复返回地址 *)
+  [ Lw (Ra, frame_size - 4, Sp);
     Lw (S0, frame_size - 8, Sp);  (* 恢复S0寄存器(帧指针) *)
     Lw (S1, frame_size - 12, Sp); (* 恢复S1寄存器 *)
-    Addi (Sp, Sp, frame_size);    (* 释放栈帧 *)
-    Ret                           (* 返回 *)
+    Addi (Sp, Sp, frame_size);
+    Ret
   ]
 
 (* 生成语句代码 *)
@@ -649,7 +652,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
     then []
     else List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
   in
-  [ Label func_def.fname; Comment ("Function: " ^ func_def.fname) ] @ prologue @ param_instrs @ body_items @ epilogue
+  prologue @ param_instrs @ body_items @ epilogue
 
 
 (* 生成整个程序的代码 *)
@@ -665,7 +668,8 @@ let gen_program symbol_table (program : Ast.program) =
   let func_asm_items =
     List.map
       (fun func_def ->
-         gen_function symbol_table func_def)
+         let items = gen_function symbol_table func_def in
+         [ Label func_def.fname; Comment ("Function: " ^ func_def.fname) ] @ items)
       program
     |> List.flatten
   in
@@ -678,6 +682,7 @@ let compile_to_riscv symbol_table program =
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
 
 
