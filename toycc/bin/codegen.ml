@@ -280,17 +280,17 @@ let create_context _symbol_table func_name =
   }
 
 
-(* 生成新标签 - 使用函数名作为前缀确保标签唯一性 *)
+(* 生成新标签 - 关键修改：使用函数名作为前缀确保标签唯一性 *)
 let new_label ctx prefix =
   let label = Printf.sprintf "%s_%s%d" ctx.func_name prefix ctx.label_counter in
   ctx.label_counter <- ctx.label_counter + 1;
   label
 
 
-(* 获取临时寄存器 - 改进版：修复寄存器溢出逻辑 *)
+(* 获取临时寄存器 - 改进版 *)
 let get_temp_reg ctx =
-  (* 可用的临时寄存器列表 *)
-  let temp_regs = [T0; T1; T2; T3; T4; T5; T6] in
+  (* 可用的临时寄存器列表，包括S0作为额外的临时寄存器 *)
+  let temp_regs = [T0; T1; T2; T3; T4; T5; T6; S0] in
   
   (* 寻找第一个未使用的寄存器 *)
   let rec find_unused_reg regs =
@@ -300,12 +300,8 @@ let get_temp_reg ctx =
         let spill_offset = ctx.stack_offset in
         ctx.stack_offset <- ctx.stack_offset - 4;
         
-        (* 选择一个寄存器进行溢出 - 优先选择不包含重要数据的寄存器 *)
-        let reg_to_spill = 
-          match List.filter (fun r -> r <> T0 && r <> T1) temp_regs with
-          | [] -> List.hd temp_regs
-          | rs -> List.hd rs
-        in
+        (* 选择一个寄存器进行溢出 - 简单选择第一个 *)
+        let reg_to_spill = List.hd temp_regs in
         
         (* 保存寄存器内容到栈，使用S0作为帧指针 *)
         let spill_instr = Sw (reg_to_spill, spill_offset, S0) in
@@ -358,12 +354,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
   match expr with
   | Ast.Literal(IntLit n) ->
     let (reg, spill_instrs) = get_temp_reg ctx in
-    let instr = 
-      if n >= -2048 && n <= 2047 then
-        [ Addi (reg, Zero, n) ]  (* 使用addi替代li以提高效率 *)
-      else
-        [ Li (reg, n) ]
-    in
+    let instr = [ Li (reg, n) ] in
     reg, spill_instrs @ instr
   | Ast.Var id ->
     let (reg, spill_instrs) = get_temp_reg ctx in
@@ -402,12 +393,9 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       | ">" -> [ Slt (result_reg, e2_reg, e1_reg) ]
       | ">=" -> [ Slt (result_reg, e1_reg, e2_reg); Xori (result_reg, result_reg, 1) ]
       | "&&" ->
-        [ Sltu (T0, Zero, e1_reg); 
-          Sltu (T1, Zero, e2_reg); 
-          And (result_reg, T0, T1) ]
+        [ Sltu (T0, Zero, e1_reg); Sltu (T1, Zero, e2_reg); And (result_reg, T0, T1) ]
       | "||" ->
-        [ Or (result_reg, e1_reg, e2_reg); 
-          Sltu (result_reg, Zero, result_reg) ]
+        [ Or (result_reg, e1_reg, e2_reg); Sltu (result_reg, Zero, result_reg) ]
       | _ -> failwith (Printf.sprintf "Unknown binary operator: %s" op)
     in
     (* 释放临时寄存器 *)
@@ -423,8 +411,8 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let stack_args = if num_args > 8 then num_args - 8 else 0 in
     let stack_arg_size = stack_args * 4 in
     
-    (* 计算需要保存的寄存器 - 增加了对A0-A7的保存，修复函数调用参数传递问题 *)
-    let save_regs = [T0; T1; T2; T3; T4; T5; T6; A0; A1; A2; A3; A4; A5; A6; A7; S0; S1] in
+    (* 计算需要保存的寄存器 *)
+    let save_regs = [T0; T1; T2; T3; T4; T5; T6; S0; S1; S2; S3; S4; S5; S6; S7; S8; S9; S10; S11] in
     let num_save_regs = List.length save_regs in
     let save_regs_size = num_save_regs * 4 in
     
@@ -519,10 +507,10 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     ctx.used_regs <- old_used_regs;
     items
   | Ast.Return (Some e) ->
-    (* 优化简单的常量返回 *)
+    (* 优化简单的0常量返回 *)
     (match e with
-     | Ast.Literal(IntLit n) ->
-       let all_instrs = [ Li (A0, n) ] @ gen_epilogue_instrs frame_size in
+     | Ast.Literal(IntLit 0) ->
+       let all_instrs = [ Li (A0, 0) ] @ gen_epilogue_instrs frame_size in
        List.map (fun i -> Instruction i) all_instrs
      | _ ->
        let e_reg, e_instrs = gen_expr ctx e in
@@ -606,8 +594,8 @@ let calculate_frame_size (func_def : Ast.func_def) =
   (* 计算超过8个的参数数量 *)
   let extra_params = max 0 (num_params - 8) in
   
-  (* ra, s0, s1 + 额外参数 + 局部变量 + 额外的栈空间用于临时数据 *)
-  let required_space = 12 + (extra_params * 4) + (num_locals * 4) + 32 in  (* 增加32字节额外空间 *)
+  (* ra, s0, s1 + 额外参数 + 局部变量 *)
+  let required_space = 12 + (extra_params * 4) + (num_locals * 4) in
   
   (* 对齐到16字节 *)
   (required_space + 15) / 16 * 16
@@ -687,12 +675,14 @@ let gen_program symbol_table (program : Ast.program) =
   in
   header @ func_asm_items
 
+
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   (* 直接将汇编项转换为字符串并打印到标准输出 *)
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
 
 
