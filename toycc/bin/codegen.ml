@@ -1,6 +1,5 @@
 open Ast
 
-
 (* RISC-V 32位寄存器 *)
 type reg =
   | Zero 
@@ -35,7 +34,6 @@ type reg =
   | T4 
   | T5 
   | T6 
-
 
 (* 将寄存器转换为字符串 *)
 let reg_to_string reg = 
@@ -72,7 +70,6 @@ let reg_to_string reg =
   | T4 -> "t4"
   | T5 -> "t5"
   | T6 -> "t6"
-
 
 (* RISC-V 指令类型 *)
 type instruction =
@@ -115,7 +112,6 @@ type instruction =
   | Mv of reg * reg (* mv rd, rs - 伪指令 *)
   (* 其他 *)
   | Nop (* nop *)
-
 
 (* 将指令转换为汇编字符串 *)
 let instr_to_string instr = match instr with
@@ -213,7 +209,6 @@ let instr_to_string instr = match instr with
   | Mv (rd, rs) -> Printf.sprintf "mv %s, %s" (reg_to_string rd) (reg_to_string rs)
   | Nop -> "nop"
 
-
 (* 标签 *)
 type label = string
 
@@ -224,14 +219,12 @@ type asm_item =
   | Comment of string
   | Directive of string
 
-
 (* 将汇编项转换为字符串 *)
 let asm_item_to_string item = match item with 
   | Instruction instr -> "    " ^ instr_to_string instr
   | Label l -> l ^ ":"
   | Directive d -> "    " ^ d
   | Comment c -> "    # " ^ c
-
 
 (* 输出汇编代码到文件 *)
 let emit_asm_to_file filepath asm_items =
@@ -243,16 +236,12 @@ let emit_asm_to_file filepath asm_items =
     asm_items;
   close_out file
 
-
 (* 输出汇编代码到标准输出 *)
 let emit_asm_to_stdout asm_items =
   List.iter
     (fun item ->
        print_endline (asm_item_to_string item))
     asm_items
-
-
-(*---------------------------------------------------------*)
 
 (* 代码生成上下文 *)
 type codegen_context =
@@ -263,27 +252,26 @@ type codegen_context =
   ; mutable continue_labels : string list (* continue 跳转标签栈 *)
   ; mutable local_vars : (string * int) list (* 局部变量映射到栈偏移 *)
   ; func_name : string (* 函数名，用于生成唯一标签 *)
+  ; param_count : int (* 参数数量，用于正确处理栈参数 *)
   }
 
-
 (* 创建新的代码生成上下文 *)
-let create_context _symbol_table func_name =
+let create_context _symbol_table func_name param_count =
   { label_counter = 0;
     temp_counter = 0;
     stack_offset = -8 ;(* fp-based offset, starts from 0 and goes down *)
     break_labels = [];
     continue_labels = [];
     local_vars = [];
-    func_name = func_name  (* 新增：保存函数名 *)
+    func_name = func_name;
+    param_count = param_count
   }
 
-
-(* 生成新标签 - 关键修复：使用函数名作为标签前缀，确保全局唯一 *)
+(* 生成新标签 *)
 let new_label ctx prefix =
   let label = Printf.sprintf "%s_%s%d" ctx.func_name prefix ctx.label_counter in
   ctx.label_counter <- ctx.label_counter + 1;
   label
-
 
 (* 获取临时寄存器 *)
 let get_temp_reg ctx =
@@ -308,7 +296,6 @@ let add_local_var ctx name =
   ctx.local_vars <- (name, ctx.stack_offset) :: ctx.local_vars;
   ctx.stack_offset
 
-
 (* 获取变量的栈偏移 *)
 let get_var_offset ctx name =
   match List.assoc_opt name ctx.local_vars with
@@ -317,7 +304,6 @@ let get_var_offset ctx name =
       failwith (Printf.sprintf "Variable '%s' not found in scope (available: %s)"
         name 
         (String.concat ", " (List.map fst ctx.local_vars)))
-
 
 (* 生成表达式代码，返回结果寄存器和指令列表 *)
 let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
@@ -441,8 +427,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     
     result_reg, save_instrs @ arg_instrs @ call_instr @ restore_instrs   
 
-
-(*生成序言*)
+(* 生成序言 *)
 let gen_prologue_instrs frame_size =
   [ Instruction(Addi (Sp, Sp, -frame_size));
     Instruction(Sw (Ra, frame_size - 4, Sp));
@@ -532,7 +517,6 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in
     List.map (fun i -> Instruction i) all_instrs
 
-
 (* 计算函数所需的栈帧大小 *)
 let calculate_frame_size (func_def : Ast.func_def) =
   (* 递归统计一个语句中包含的 Decl 数量 *)
@@ -554,12 +538,12 @@ let calculate_frame_size (func_def : Ast.func_def) =
   (* 16字节对齐 *)
   (required_space + 15) / 16 * 16
 
-
 (* 生成函数代码 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
-  (* 关键修复：为每个函数创建独立上下文，并传入函数名 *)
-  let ctx = create_context symbol_table func_def.fname in
-  (*计算栈帧*)
+  let param_count = List.length func_def.params in
+  (* 为每个函数创建独立上下文，并传入函数名和参数数量 *)
+  let ctx = create_context symbol_table func_def.fname param_count in
+  (* 计算栈帧 *)
   let frame_size = calculate_frame_size func_def in
   (* 函数序言 *)
   let prologue = gen_prologue_instrs frame_size  in
@@ -615,24 +599,31 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   in
   prologue @ param_instrs @ body_items @ epilogue
 
-
 (* 生成整个程序的代码 *)
 let gen_program symbol_table (program : Ast.program) =
   (* 全局声明 *)
   let header =
-    [ Directive ".text"; Directive ".globl main"; Comment "ToyC Compiler Generated Code" ]
+    [ Directive ".text"; 
+      Directive ".globl main"; 
+      Comment "ToyC Compiler Generated Code";
+      Directive ".align 2"  (* 添加对齐指令 *)
+    ]
   in
   (* 生成所有函数 *)
   let func_asm_items =
     List.map
       (fun func_def ->
          let items = gen_function symbol_table func_def in
-         [ Label func_def.fname; Comment ("Function: " ^ func_def.fname) ] @ items)
+         [ Label func_def.fname; 
+           Comment ("Function: " ^ func_def.fname);
+           Directive ".align 2"  (* 函数对齐 *)
+         ] @ items)
       program
     |> List.flatten
   in
   header @ func_asm_items
-  (* 主入口函数：编译程序并输出汇编文件 *)
+
+(* 主入口函数：编译程序并输出汇编文件 *)
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   (* 直接将汇编项转换为字符串并打印到标准输出 *)
