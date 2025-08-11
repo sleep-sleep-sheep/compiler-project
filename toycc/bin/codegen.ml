@@ -362,25 +362,22 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       | ">=" -> [ Slt (result_reg, e1_reg, e2_reg); Xori (result_reg, result_reg, 1) ]
       | "&&" ->
     (* 逻辑与运算 - 优化短路行为 *)
-    let and_label = new_label ctx "and" in
     let end_label = new_label ctx "endand" in
-    (* 先添加标签作为单独的asm_item，再添加指令 *)
     [ Sltu (T0, Zero, e1_reg)
     ; Beq (T0, Zero, end_label)  (* 如果e1为假，直接结果为假 *)
     ; Sltu (result_reg, Zero, e2_reg)
     ; J end_label ]
-    (* 注意：Label不应放在instruction列表中，而应放在外层的asm_item列表中 *)
-      | "||" ->
-        (* 逻辑或运算 - 优化短路行为 *)
-        let or_label = new_label ctx "or" in
-        let end_label = new_label ctx "endorr" in
-        [ Sltu (T0, Zero, e1_reg)
-        ; Bne (T0, Zero, or_label)  (* 如果e1为真，直接结果为真 *)
-        ; Sltu (result_reg, Zero, e2_reg)
-        ; J end_label
-        ; Label or_label
-        ; Li (result_reg, 1)
-        ; Label end_label ]
+  | "||" ->
+    (* 逻辑或运算 - 优化短路行为 *)
+    let or_label = new_label ctx "or" in
+    let end_label = new_label ctx "endorr" in
+    [ Sltu (T0, Zero, e1_reg)
+    ; Bne (T0, Zero, or_label)  (* 如果e1为真，直接结果为真 *)
+    ; Sltu (result_reg, Zero, e2_reg)
+    ; J end_label
+    ; J or_label  (* 跳转跳过下面的指令 *)
+    ]
+    
       | _ -> failwith (Printf.sprintf "Unknown binary operator: %s" op)
     in
     let instrs = e1_instrs @ e2_instrs @ op_instrs in
@@ -686,4 +683,5 @@ let compile_to_riscv symbol_table program =
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
