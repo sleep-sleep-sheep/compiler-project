@@ -36,17 +36,11 @@ let () =
     print_string assembly
     
   with
-  | Lexer.Error msg ->
-      Printf.eprintf "Lexer error: %s\n" msg;
-      exit 1
-  | Parser.Error ->
-      let pos = Lexing.lexeme_start_p Lexing.from_channel stdin in
-      Printf.eprintf "Parser error at line %d, column %d\n" 
-        pos.pos_lnum (pos.pos_cnum - pos.pos_bol);
-      exit 1
+  
   | Failure msg ->
       Printf.eprintf "Semantic error: %s\n" msg;
       exit 1
   | e ->
       Printf.eprintf "Unknown error: %s\n" (Printexc.to_string e);
       exit 1  
+
