@@ -274,11 +274,11 @@ let create_context _symbol_table func_name =
     break_labels = [];
     continue_labels = [];
     local_vars = [];
-    func_name = func_name  (* 保存函数名 *)
+    func_name = func_name  (* 新增：保存函数名 *)
   }
 
 
-(* 生成新标签 *)
+(* 生成新标签 - 关键修复：使用函数名作为标签前缀，确保全局唯一 *)
 let new_label ctx prefix =
   let label = Printf.sprintf "%s_%s%d" ctx.func_name prefix ctx.label_counter in
   ctx.label_counter <- ctx.label_counter + 1;
@@ -372,27 +372,26 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     result_reg, instrs
   | Ast.Call (fname, args) ->
     let result_reg = A0 in
-    (* 计算需要保存在栈上的参数数量 *)
+    (* 计算需要通过栈传递的参数数量 *)
     let num_stack_args = max 0 (List.length args - 8) in
-    (* 计算栈上参数需要的空间（每个4字节）加上临时寄存器保存空间 *)
-    let stack_args_size = num_stack_args * 4 in
-    let temp_save_size = 28 in (* T0-T6共7个寄存器，每个4字节 *)
-    let total_stack_usage = stack_args_size + temp_save_size in
+    (* 计算需要保存的寄存器和栈参数所需的空间 *)
+    let stack_args_space = num_stack_args * 4 in
+    let temp_regs_space = 7 * 4 in (* T0-T6 *)
+    let stack_space = stack_args_space + temp_regs_space in
     
-    (* 为栈上参数和临时寄存器分配栈空间 *)
+    (* 为栈参数和临时寄存器预留空间 *)
     let save_instrs = 
-      if total_stack_usage > 0 then
-        [Addi (Sp, Sp, -total_stack_usage)]
+      if stack_space > 0 then
+        Addi (Sp, Sp, -stack_space) ::
+        (* 保存临时寄存器 *)
+        [ Sw (T0, temp_regs_space - 4, Sp);
+          Sw (T1, temp_regs_space - 8, Sp);
+          Sw (T2, temp_regs_space - 12, Sp);
+          Sw (T3, temp_regs_space - 16, Sp);
+          Sw (T4, temp_regs_space - 20, Sp);
+          Sw (T5, temp_regs_space - 24, Sp);
+          Sw (T6, temp_regs_space - 28, Sp) ]
       else []
-      @ [
-        Sw (T0, stack_args_size + 0, Sp);
-        Sw (T1, stack_args_size + 4, Sp);
-        Sw (T2, stack_args_size + 8, Sp);
-        Sw (T3, stack_args_size + 12, Sp);
-        Sw (T4, stack_args_size + 16, Sp);
-        Sw (T5, stack_args_size + 20, Sp);
-        Sw (T6, stack_args_size + 24, Sp);
-      ]
     in
     
     (* 处理参数：前8个用寄存器，其余用栈 *)
@@ -417,26 +416,27 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
              arg_code @ [ Mv (target_reg, arg_reg) ]
            else
              (* 超过8个的参数使用栈传递 *)
-             arg_code @ [ Sw (arg_reg, (i - 8) * 4, Sp) ])
+             let stack_pos = (i - 8) * 4 + temp_regs_space in
+             arg_code @ [ Sw (arg_reg, stack_pos, Sp) ])
         args
       |> List.flatten
     in
     
     let call_instr = [ Jal (Ra, fname) ] in
     
-    (* 恢复临时寄存器和栈空间 *)
-    let restore_instrs = [
-      Lw (T0, stack_args_size + 0, Sp);
-      Lw (T1, stack_args_size + 4, Sp);
-      Lw (T2, stack_args_size + 8, Sp);
-      Lw (T3, stack_args_size + 12, Sp);
-      Lw (T4, stack_args_size + 16, Sp);
-      Lw (T5, stack_args_size + 20, Sp);
-      Lw (T6, stack_args_size + 24, Sp);
-    ]
-    @ (if total_stack_usage > 0 then
-         [Addi (Sp, Sp, total_stack_usage)]
-       else [])
+    (* 恢复临时寄存器和栈指针 *)
+    let restore_instrs =
+      if stack_space > 0 then
+        (* 恢复临时寄存器 *)
+        [ Lw (T0, temp_regs_space - 4, Sp);
+          Lw (T1, temp_regs_space - 8, Sp);
+          Lw (T2, temp_regs_space - 12, Sp);
+          Lw (T3, temp_regs_space - 16, Sp);
+          Lw (T4, temp_regs_space - 20, Sp);
+          Lw (T5, temp_regs_space - 24, Sp);
+          Lw (T6, temp_regs_space - 28, Sp);
+          Addi (Sp, Sp, stack_space) ]
+      else []
     in
     
     result_reg, save_instrs @ arg_instrs @ call_instr @ restore_instrs   
@@ -549,47 +549,48 @@ let calculate_frame_size (func_def : Ast.func_def) =
   let num_locals =
     List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
   let num_params = List.length func_def.params in
-  (* 计算栈上参数的数量 (超过8个的参数) *)
-  let num_stack_params = max 0 (num_params - 8) in
-  (* ra, fp + 寄存器参数 + 栈上参数 + 局部变量 *)
-  let required_space = 8 + (8 * 4) + (num_stack_params * 4) + (num_locals * 4) in
+  (* ra, fp + 参数 + 局部变量 *)
+  let required_space = 8 + (num_params * 4) + (num_locals * 4) in
   (* 16字节对齐 *)
   (required_space + 15) / 16 * 16
 
 
 (* 生成函数代码 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
-  (* 为每个函数创建独立上下文，并传入函数名 *)
+  (* 关键修复：为每个函数创建独立上下文，并传入函数名 *)
   let ctx = create_context symbol_table func_def.fname in
   (*计算栈帧*)
   let frame_size = calculate_frame_size func_def in
   (* 函数序言 *)
   let prologue = gen_prologue_instrs frame_size  in
-  (* 处理参数：前8个用寄存器，其余从栈上读取 *)
+  (* 处理参数：前8个用寄存器，其余用栈 *)
   let param_instrs =
     List.mapi
       (fun i { Ast.pname = name; _ } ->
        let offset = add_local_var ctx name in
-       if i < 8 then
-         (* 前8个参数来自a0-a7寄存器 *)
-         let arg_reg =
-           match i with
-           | 0 -> A0
-           | 1 -> A1
-           | 2 -> A2
-           | 3 -> A3
-           | 4 -> A4
-           | 5 -> A5
-           | 6 -> A6
-           | 7 -> A7
-           | _ -> failwith "Invalid register index"
-         in
-         [ Instruction (Sw (arg_reg, offset, Fp)) ]
-       else
-         (* 超过8个的参数从栈上读取 (fp + 16 是第一个栈参数的位置) *)
-         let stack_offset = 16 + (i - 8) * 4 in
-         [ Instruction (Lw (T0, stack_offset, Fp));
-           Instruction (Sw (T0, offset, Fp)) ])
+       let instr =
+         if i < 8 then
+           (* 前8个参数使用a0-a7寄存器 *)
+           let arg_reg =
+             match i with
+             | 0 -> A0
+             | 1 -> A1
+             | 2 -> A2
+             | 3 -> A3
+             | 4 -> A4
+             | 5 -> A5
+             | 6 -> A6
+             | 7 -> A7
+             | _ -> failwith "Invalid register index"
+           in
+           [ Instruction (Sw (arg_reg, offset, Fp)) ]
+         else
+           (* 超过8个的参数从栈中读取 *)
+           let stack_offset = (i - 8) * 4 + 16 in (* 跳过ra和fp *)
+           [ Instruction (Lw (T0, stack_offset, Sp));
+             Instruction (Sw (T0, offset, Fp)) ]
+       in
+       instr)
       func_def.params
     |> List.flatten
   in
@@ -638,23 +639,3 @@ let compile_to_riscv symbol_table program =
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
