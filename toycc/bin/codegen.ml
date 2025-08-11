@@ -455,7 +455,7 @@ let calculate_frame_size ctx num_params =
   let total_space = 8 + local_vars_space + saved_regs_space + params_space in
   
   (* 16字节对齐 *)
-  if total_space % 16 = 0 then total_space else total_space + (16 - total_space % 16)
+  if total_space mod 16 = 0 then total_space else total_space + (16 - total_space mod 16)
 
 (* 生成函数代码 *)
 let gen_function symbol_table (func_def: Ast.func_def) : asm_item list =
@@ -526,3 +526,4 @@ let gen_program symbol_table (program: Ast.program) =
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter (fun item -> print_endline (asm_item_to_string item)) asm_items
+
