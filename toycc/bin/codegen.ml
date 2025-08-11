@@ -142,7 +142,7 @@ type codegen_context = {
 }
 
 (* 创建新的代码生成上下文 *)
-let create_context symbol_table func_name = {
+let create_context _ func_name = {
   label_counter = 0;
   temp_counter = 0;
   stack_offset = -8;  (* 初始偏移，为ra和fp预留空间 *)
@@ -314,7 +314,7 @@ let rec gen_expr ctx (expr: Ast.expr) : reg * instruction list =
 (* 生成函数序言：保存被调用者寄存器和设置栈帧 *)
 let gen_prologue ctx frame_size =
   (* 计算需要保存的寄存器数量 *)
-  let num_saved_regs = List.length ctx.used_saved_regs in
+  let _ = List.length ctx.used_saved_regs in
   
   (* 1. 分配栈空间 *)
   let prologue = [Addi (Sp, Sp, -frame_size)] in
@@ -337,7 +337,7 @@ let gen_prologue ctx frame_size =
 
 (* 生成函数尾声：恢复寄存器和返回 *)
 let gen_epilogue ctx frame_size =
-  let num_saved_regs = List.length ctx.used_saved_regs in
+  let _ = List.length ctx.used_saved_regs in
   
   (* 1. 恢复被调用者寄存器 *)
   let epilogue = 
@@ -526,4 +526,5 @@ let gen_program symbol_table (program: Ast.program) =
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter (fun item -> print_endline (asm_item_to_string item)) asm_items
+
 
