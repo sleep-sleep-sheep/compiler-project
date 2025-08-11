@@ -354,8 +354,8 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let result_reg = A0 in
     (* 计算需要通过栈传递的参数数量 *)
     let num_stack_args = max 0 (List.length args - 8) in
-    (* 计算栈参数所需空间 *)
-    let stack_args_space = num_stack_args * 4 in
+    (* 计算栈参数所需空间，确保16字节对齐 *)
+    let stack_args_space = ((num_stack_args * 4) + 15) land lnot 15 in
     
     (* 为栈参数预留空间 *)
     let alloc_stack_instr = 
@@ -389,7 +389,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
              else
                (* 超过8个的参数使用栈传递 *)
                let stack_pos = (i - 8) * 4 in
-               arg_code @ [ Sw (arg_reg, stack_pos, Sp) ]
+               arg_code @ [ Sw (arg_reg, stack_pos - stack_args_space, Sp) ]
            in
            release_temp_reg ctx;  (* 释放arg_reg *)
            instrs)
@@ -428,16 +428,16 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
 let gen_prologue_instrs frame_size =
   [ 
     Instruction(Addi (Sp, Sp, -frame_size));  (* 分配栈帧 *)
-    Instruction(Sw (Ra, 4, Sp));              (* 保存返回地址 *)
-    Instruction(Sw (S0, 8, Sp));              (* 保存s0/fp *)
+    Instruction(Sw (Ra, frame_size - 4, Sp));  (* 保存返回地址，修正偏移计算 *)
+    Instruction(Sw (S0, frame_size - 8, Sp));  (* 保存s0/fp，修正偏移计算 *)
     Instruction(Addi (S0, Sp, frame_size));   (* 设置新的帧指针 *)
   ]
 
 (* 生成尾声 - 遵循RISC-V ABI *)
 let gen_epilogue_instrs frame_size =
   [ 
-    Lw (Ra, 4, Sp);       (* 恢复返回地址 *)
-    Lw (S0, 8, Sp);       (* 恢复s0/fp *)
+    Lw (Ra, frame_size - 4, Sp);  (* 恢复返回地址，修正偏移计算 *)
+    Lw (S0, frame_size - 8, Sp);  (* 恢复s0/fp，修正偏移计算 *)
     Addi (Sp, Sp, frame_size);  (* 释放栈帧 *)
     Ret                   (* 返回 *)
   ]
@@ -544,11 +544,11 @@ let calculate_frame_size (func_def : Ast.func_def) =
     List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
   let num_params = List.length func_def.params in
   (* 计算所需空间: 
-     - 12字节用于ra(4)、s0(8)和对齐(12)
+     - 16字节用于ra(4)、s0(8)和对齐(16)
      - 被调用者保存寄存器: 12个寄存器 × 4字节 = 48字节
      - 参数和局部变量: 每个4字节
   *)
-  let required_space = 12 + 48 + (num_params * 4) + (num_locals * 4) in
+  let required_space = 16 + 48 + (num_params * 4) + (num_locals * 4) in
   (* 16字节对齐 *)
   let aligned = (required_space + 15) / 16 * 16 in
   max aligned 16  (* 最小栈帧为16字节 *)
@@ -584,7 +584,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
            [ Instruction (Sw (arg_reg, offset, S0)) ]  (* 保存到栈帧 *)
          else
            (* 超过8个的参数从栈中读取 (相对于sp) *)
-           let stack_offset = 16 + (i - 8) * 4 in  (* 跳过ra和s0 *)
+           let stack_offset = 16 + (i - 8) * 4 in  (* 跳过ra和s0，修正偏移 *)
            [ Instruction (Lw (T0, stack_offset, Sp));
              Instruction (Sw (T0, offset, S0)) ]
        in
