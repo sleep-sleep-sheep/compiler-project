@@ -194,7 +194,7 @@ let create_context func_name = {
   label_counter = 0;
   temp_counter = 0;
   pos_counter = 0;
-  stack_offset = -8;  (* fp-based offset, 初始为-8以避开ra和fp *)
+  stack_offset = -4;  (* 修复：从-4开始，正确对齐 *)
   frame_size = 0;
   break_labels = [];
   continue_labels = [];
@@ -413,7 +413,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
           Addi (Sp, Sp, -stack_space) ::
           (* 保存调用者保存寄存器 *)
           List.mapi (fun i r ->
-            Sw (r, saved_regs_space - (i + 1) * 4, Sp)
+            Sw (r, i * 4, Sp)  (* 修复：从栈顶开始保存 *)
           ) caller_regs_to_save
         else []
       in
@@ -452,7 +452,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
         if stack_space > 0 then
           (* 恢复调用者保存寄存器 *)
           List.mapi (fun i r ->
-            Lw (r, saved_regs_space - (i + 1) * 4, Sp)
+            Lw (r, i * 4, Sp)  (* 修复：从栈顶开始恢复 *)
           ) caller_regs_to_save
           @ [Addi (Sp, Sp, stack_space)]
         else []
@@ -465,14 +465,14 @@ let gen_prologue ctx =
   (* 保存被调用者保存寄存器 *)
   let save_callee_regs =
     List.mapi (fun i reg ->
-      Sw (reg, 8 + i * 4, Sp)  (* 8字节用于ra和fp *)
+      Sw (reg, 4 * (i + 2), Sp)  (* 修复：从ra和s0之后开始保存 *)
     ) ctx.used_callee_regs
   in
   
   [ Instruction (Addi (Sp, Sp, -ctx.frame_size));
-    Instruction (Sw (Ra, ctx.frame_size - 4, Sp));  (* 保存返回地址 *)
-    Instruction (Sw (S0, ctx.frame_size - 8, Sp));  (* 保存帧指针(S0) *)
-    Instruction (Addi (S0, Sp, ctx.frame_size)) ]   (* 设置新的帧指针 *)
+    Instruction (Sw (Ra, 0, Sp));  (* 修复：保存返回地址到栈顶 *)
+    Instruction (Sw (S0, 4, Sp));  (* 修复：保存帧指针到栈顶+4 *)
+    Instruction (Addi (S0, Sp, ctx.frame_size)) ]  (* 设置新的帧指针 *)
   @ List.map (fun i -> Instruction i) save_callee_regs
 
 (* 生成函数尾声 *)
@@ -480,14 +480,14 @@ let gen_epilogue ctx =
   (* 恢复被调用者保存寄存器 *)
   let restore_callee_regs =
     List.mapi (fun i reg ->
-      Lw (reg, 8 + i * 4, Sp)  (* 8字节用于ra和fp *)
+      Lw (reg, 4 * (i + 2), Sp)  (* 修复：从保存位置恢复 *)
     ) ctx.used_callee_regs
   in
   
   List.map (fun i -> Instruction i) restore_callee_regs
-  @ [ Instruction (Lw (Ra, ctx.frame_size - 4, Sp));  (* 恢复返回地址 *)
-      Instruction (Lw (S0, ctx.frame_size - 8, Sp));  (* 恢复帧指针 *)
-      Instruction (Addi (Sp, Sp, ctx.frame_size));    (* 恢复栈指针 *)
+  @ [ Instruction (Lw (Ra, 0, Sp));  (* 修复：从栈顶恢复返回地址 *)
+      Instruction (Lw (S0, 4, Sp));  (* 修复：从栈顶+4恢复帧指针 *)
+      Instruction (Addi (Sp, Sp, ctx.frame_size));  (* 恢复栈指针 *)
       Instruction Ret ]
 
 (* 递归统计声明数量 *)
@@ -505,7 +505,7 @@ let calculate_frame_size func_def ctx =
   let num_params = List.length func_def.params in
   let num_callee_saved = List.length ctx.used_callee_regs in
   
-  (* 计算基本栈空间需求 *)
+  (* 计算基本栈空间需求：ra(4) + s0(4) + 被调用者保存寄存器 + 局部变量和参数 *)
   let base_size = 
     8  (* ra和fp的保存区 *)
     + num_callee_saved * 4  (* 被调用者保存寄存器 *)
@@ -513,7 +513,7 @@ let calculate_frame_size func_def ctx =
   in
   
   (* 16字节对齐 *)
-  let aligned_size = (base_size + 15) / 16 * 16 in
+  let aligned_size = (base_size + 15) land lnot 15 in
   ctx.frame_size <- aligned_size;
   aligned_size
 
@@ -667,7 +667,7 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
           [Instruction (Sw (arg_reg, offset, S0))]
         else
           (* 超过8个的参数从栈中读取 *)
-          let stack_offset = (i - 8) * 4 + 16 in  (* 跳过ra和fp *)
+          let stack_offset = (i - 8) * 4 + 16 in  (* 修复：正确计算栈上参数偏移 *)
           [Instruction (Lw (T0, stack_offset, Sp));
            Instruction (Sw (T0, offset, S0))]
       ) func_def.params
@@ -776,4 +776,3 @@ let compile_to_riscv filepath program =
 let compile_to_stdout program =
   let asm_items = gen_program program in
   List.iter (fun item -> print_endline (asm_item_to_string item)) asm_items
-
