@@ -524,15 +524,10 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     ctx.temp_regs <- old_temp_regs;
     items
   | Ast.Return (Some e) ->
-    (match e with
-     | Ast.Literal(IntLit 0) ->
-       let all_instrs = [ Li (A0, 0) ] @ gen_epilogue_instrs frame_size in
-       List.map (fun i -> Instruction i) all_instrs
-     | _ ->
-       let e_reg, e_instrs = gen_expr ctx e in
-       let all_instrs = e_instrs @ [ Mv (A0, e_reg) ] @ gen_epilogue_instrs frame_size in
-       release_temp_reg ctx e_reg;
-       List.map (fun i -> Instruction i) all_instrs)
+    let e_reg, e_instrs = gen_expr ctx e in
+    let all_instrs = e_instrs @ [ Mv (A0, e_reg) ] @ gen_epilogue_instrs frame_size in
+    release_temp_reg ctx e_reg;
+    List.map (fun i -> Instruction i) all_instrs
   | Ast.Return None -> List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
   | Ast.If (cond, then_stmt, else_stmt) ->
     let cond_reg, cond_instrs = gen_expr ctx cond in
@@ -603,11 +598,12 @@ let calculate_frame_size (func_def : Ast.func_def) =
   let num_locals =
     List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
   let num_params = List.length func_def.params in
-  (* ra, fp + 参数 + 局部变量 + 额外安全空间 *)
-  let required_space = 8 + (num_params * 4) + (num_locals * 4) + 64 in
+  (* ra, fp + S寄存器 + 参数 + 局部变量 + 额外安全空间 *)
+  let required_space = 8 + 44 + (num_params * 4) + (num_locals * 4) + 64 in
   (* 16字节对齐 *)
   let aligned = (required_space + 15) / 16 * 16 in
-  max aligned 64
+  max aligned 64  (* 确保至少64字节的栈帧 *)
+
 (* 生成函数代码 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   (* 为每个函数创建独立上下文 *)
@@ -647,6 +643,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
       func_def.params
     |> List.flatten
   in
+  
   (* 保存S寄存器（被调用者保存寄存器） *)
   let save_s_regs =
     [ Instruction (Sw (S1, -12, Fp));  (* s1 (fp) 已经在序言中保存 *)
@@ -694,7 +691,9 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
     in
     if has_ret
     then []
-    else List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
+    else 
+      (* 添加默认返回0的指令 *)
+      [ Instruction (Li (A0, 0)) ] @ List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
   in
   
   (* 组合所有部分：序言 -> 保存S寄存器 -> 参数处理 -> 函数体 -> 恢复S寄存器 -> 尾声 *)
