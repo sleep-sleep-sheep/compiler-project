@@ -71,6 +71,16 @@ let reg_to_string reg =
   | T5 -> "t5"
   | T6 -> "t6"
 
+(* 辅助函数：正确拆分立即数为高位和低位，确保低位在addi范围内 *)
+let split_imm imm =
+  let lower = imm mod 4096 in  (* 取低12位 *)
+  let adjusted_lower = 
+    if lower > 2047 then lower - 4096  (* 转换为12位带符号数 *)
+    else lower 
+  in
+  let upper = (imm - adjusted_lower) / 4096 in  (* 计算高位 *)
+  (upper, adjusted_lower)
+
 (* RISC-V 指令类型 *)
 type instruction =
   (* 算术指令 *)
@@ -199,8 +209,7 @@ let instr_to_string instr = match instr with
     if imm >= -2048 && imm <= 2047 then
       Printf.sprintf "li %s, %d" (reg_to_string rd) imm
     else
-      let upper = (imm asr 12) in  (* 符号扩展的高20位 *)
-      let lower = imm land 0xFFF in
+      let (upper, lower) = split_imm imm in  (* 使用修正的拆分函数 *)
       Printf.sprintf "lui %s, %d\n    addi %s, %s, %d"
         (reg_to_string rd) upper
         (reg_to_string rd) (reg_to_string rd) lower
@@ -334,8 +343,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       if n >= -2048 && n <= 2047 then
         [ Li (reg, n) ]
       else
-        let upper = (n asr 12) in  (* 符号扩展的高20位 *)
-        let lower = n land 0xFFF in
+        let (upper, lower) = split_imm n in  (* 使用修正的拆分函数 *)
         [ Lui (reg, upper); Addi (reg, reg, lower) ]
     in
     reg, instrs
