@@ -194,7 +194,7 @@ let create_context func_name = {
   label_counter = 0;
   temp_counter = 0;
   pos_counter = 0;
-  stack_offset = -4;  (* fp-based offset，修复初始偏移值 *)
+  stack_offset = -8;  (* fp-based offset, 初始为-8以避开ra和fp *)
   frame_size = 0;
   break_labels = [];
   continue_labels = [];
@@ -388,7 +388,6 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       
   | Ast.Call (fname, args) ->
       let result_reg = A0 in
-      let prev_a0_used = List.assoc A0 ctx.regs_in_use in
       set_reg_used ctx result_reg true;
       
       (* 计算需要通过栈传递的参数数量 *)
@@ -402,10 +401,11 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
         |> List.map fst
       in
       
-      (* 计算栈空间需求 *)
+      (* 计算栈空间需求，确保16字节对齐 *)
       let stack_args_space = num_stack_args * 4 in
       let saved_regs_space = List.length caller_regs_to_save * 4 in
       let stack_space = stack_args_space + saved_regs_space in
+      let stack_space = (stack_space + 15) land lnot 15 in  (* 16字节对齐 *)
       
       (* 为栈操作预留空间 *)
       let save_instrs = 
@@ -457,9 +457,6 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
           @ [Addi (Sp, Sp, stack_space)]
         else []
       in
-      
-      (* 恢复A0的原始使用状态 *)
-      set_reg_used ctx A0 prev_a0_used;
       
       result_reg, save_instrs @ arg_instrs @ call_instr @ restore_instrs
 
@@ -683,16 +680,49 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
   (* 计算栈帧大小 *)
   let _ = calculate_frame_size func_def ctx in
   
-  (* 重置位置计数器并重新生成函数体 *)
-  ctx.pos_counter <- 0;
+  (* 重置上下文进行实际代码生成 *)
+  let ctx = create_context func_def.fname in
+  List.iter pre_scan_stmt func_def.body;
+  
+  (* 重新处理参数 *)
+  let param_instrs =
+    List.mapi
+      (fun i { Ast.pname = name; _ } ->
+        let start_pos = 0 in
+        let end_pos = 100 in
+        let var_info = add_local_var ctx name start_pos end_pos in
+        let offset = ctx.stack_offset in
+        ctx.stack_offset <- offset - 4;
+        var_info.stack_offset <- Some offset;
+        
+        if i < 8 then
+          let arg_reg =
+            match i with
+            | 0 -> A0 | 1 -> A1 | 2 -> A2 | 3 -> A3
+            | 4 -> A4 | 5 -> A5 | 6 -> A6 | 7 -> A7
+            | _ -> failwith "Invalid parameter index"
+          in
+          [Instruction (Sw (arg_reg, offset, S0))]
+        else
+          let stack_offset = (i - 8) * 4 + 16 in
+          [Instruction (Lw (T0, stack_offset, Sp));
+           Instruction (Sw (T0, offset, S0))]
+      ) func_def.params
+    |> List.flatten
+  in
+  
+  (* 重新计算栈帧大小 *)
+  let _ = calculate_frame_size func_def ctx in
+  
+  (* 生成函数序言 *)
+  let prologue = gen_prologue ctx in
+  
+  (* 生成函数体 *)
   let body_items =
     func_def.body
     |> List.map (gen_stmt ctx)
     |> List.flatten
   in
-  
-  (* 生成函数序言 *)
-  let prologue = gen_prologue ctx in
   
   (* 检查是否有返回指令，如果没有则添加默认返回 *)
   let has_return =
