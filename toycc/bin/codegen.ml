@@ -316,6 +316,12 @@ let release_var_reg ctx var_name =
       var_info.var_reg <- None
   | None -> ()
 
+(* 安全释放变量寄存器的辅助函数 *)
+let safe_release_var_reg ctx expr =
+  match expr with
+  | Ast.Var id -> release_var_reg ctx id
+  | _ -> ()
+
 (* 生成表达式代码 *)
 let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
   update_pos ctx;
@@ -348,8 +354,8 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
         | "!" -> [Sltiu (result_reg, e_reg, 1)]
         | _ -> failwith (Printf.sprintf "Unknown unary operator: %s" op)
       in
-      (* 释放操作数寄存器 *)
-      release_var_reg ctx (match e with Ast.Var id -> id | _ -> "");
+      (* 安全释放操作数寄存器 - 只在是变量时才释放 *)
+      safe_release_var_reg ctx e;
       result_reg, e_instrs @ alloc_instrs @ op_instrs
       
   | Ast.BinOp (e1, op, e2) ->
@@ -375,9 +381,9 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
             [Or (result_reg, e1_reg, e2_reg); Sltu (result_reg, Zero, result_reg)]
         | _ -> failwith (Printf.sprintf "Unknown binary operator: %s" op)
       in
-      (* 释放操作数寄存器 *)
-      release_var_reg ctx (match e1 with Ast.Var id -> id | _ -> "");
-      release_var_reg ctx (match e2 with Ast.Var id -> id | _ -> "");
+      (* 安全释放操作数寄存器 - 只在是变量时才释放 *)
+      safe_release_var_reg ctx e1;
+      safe_release_var_reg ctx e2;
       result_reg, e1_instrs @ e2_instrs @ alloc_instrs @ op_instrs
       
   | Ast.Call (fname, args) ->
@@ -433,6 +439,9 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
           ) args
         |> List.flatten
       in
+      
+      (* 释放参数寄存器 *)
+      List.iter (fun arg -> safe_release_var_reg ctx arg) args;
       
       (* 函数调用指令 *)
       let call_instr = [Jal (Ra, fname)] in
