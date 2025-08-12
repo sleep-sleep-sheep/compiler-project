@@ -646,7 +646,7 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
   List.iter pre_scan_stmt func_def.body;
   
   (* 处理参数 *)
-  let param_instrs =
+  let _ =
     List.mapi
       (fun i { Ast.pname = name; _ } ->
         let start_pos = 0 in
@@ -776,3 +776,4 @@ let compile_to_riscv filepath program =
 let compile_to_stdout program =
   let asm_items = gen_program program in
   List.iter (fun item -> print_endline (asm_item_to_string item)) asm_items
+
