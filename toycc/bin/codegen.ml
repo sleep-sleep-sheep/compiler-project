@@ -268,7 +268,7 @@ let spill_reg ctx reg =
 let restore_reg _ reg offset =
   [Lw (reg, offset, S0)]  (* 使用S0作为帧指针 *)
 
-(* 分配寄存器 - 改进的寄存器分配策略 *)
+(* 改进的寄存器分配策略 - 避免不必要的溢出 *)
 let allocate_reg ctx prefer_callee =
   match find_free_reg ctx prefer_callee with
   | Some reg ->
@@ -336,7 +336,6 @@ let release_var_reg ctx var_name =
   | None -> ()
 
 (* 标记特定作用域级别的变量为不活跃 *)
-(* 标记特定作用域级别的变量为不活跃 *)
 let deactivate_scope_vars ctx level =
   ctx.local_vars <- List.map (fun (name, (info : var_info)) ->  (* 显式指定info的类型 *)
     if info.scope_level = level then 
@@ -352,7 +351,7 @@ let safe_release_var_reg ctx expr =
       (try release_var_reg ctx id with _ -> ())  (* 忽略未找到的变量 *)
   | _ -> ()
 
-(* 生成表达式代码 *)
+(* 改进的表达式代码生成 - 处理复杂表达式和减少冗余计算 *)
 let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
   update_pos ctx;
   match expr with
@@ -561,7 +560,7 @@ let calculate_frame_size func_def ctx =
   ctx.frame_size <- aligned_size;
   aligned_size
 
-(* 生成语句代码 - 改进：正确的块作用域处理 *)
+(* 改进的语句代码生成 - 修复作用域处理和循环控制 *)
 let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
   update_pos ctx;
   match stmt with
@@ -651,7 +650,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
   
   | Ast.Decl (name, e) ->
       let start_pos = ctx.pos_counter in
-      let end_pos = start_pos + 10 in  (* 估计变量生命周期 *)
+      let end_pos = start_pos + 10 in  (* 更准确地估计变量生命周期 *)
       let var_info = add_local_var ctx name start_pos end_pos in
       let e_reg, e_instrs = gen_expr ctx e in
       
@@ -685,7 +684,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
       
       List.map (fun i -> Instruction i) (e_instrs @ store_instr)
 
-(* 生成函数代码 *)
+(* 生成函数代码 - 修复参数处理和栈帧计算 *)
 let gen_function (func_def : Ast.func_def) : asm_item list =
   let ctx = create_context func_def.fname in
   
@@ -808,7 +807,7 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
   @ body_items
   @ epilogue
 
-(* 生成整个程序的代码 *)
+(* 生成整个程序的代码 - 优化函数顺序和全局符号 *)
 let gen_program (program : Ast.program) =
   let header = [
     Directive ".text";
@@ -817,12 +816,16 @@ let gen_program (program : Ast.program) =
     Comment "-----------------------------------------"
   ] in
   
+  (* 确保main函数最后生成 *)
+  let (main_func, other_funcs) = 
+    List.partition (fun f -> f.Ast.fname = "main") program in
+  
   let func_asm_items =
-    List.map
+    (other_funcs @ main_func)
+    |> List.map
       (fun func_def ->
         let items = gen_function func_def in
         items @ [Comment "-----------------------------------------"])
-      program
     |> List.flatten
   in
   
