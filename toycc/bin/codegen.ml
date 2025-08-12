@@ -162,7 +162,8 @@ type var_info = {
   var_interval: interval;
   mutable var_reg: reg option;  (* 分配的寄存器 *)
   mutable stack_offset: int option;  (* 栈偏移，如果溢出到栈 *)
-  mutable is_active: bool;      (* 新增：标记变量是否在当前作用域活跃 *)
+  mutable is_active: bool;      (* 标记变量是否在当前作用域活跃 *)
+  scope_level: int;             (* 变量所在的作用域级别 *)
 }
 
 (* 代码生成上下文 *)
@@ -172,10 +173,10 @@ type codegen_context = {
   mutable temp_counter: int;
   mutable pos_counter: int;  (* 用于跟踪指令位置，计算活跃区间 *)
   
-  (* 栈管理 - 修复：更精确的栈偏移计算 *)
+  (* 栈管理 *)
   mutable stack_offset: int;  (* 当前栈偏移，基于fp *)
   mutable frame_size: int;    (* 栈帧大小 *)
-  mutable max_stack_usage: int; (* 新增：跟踪最大栈使用量 *)
+  mutable max_stack_usage: int; (* 跟踪最大栈使用量 *)
   
   (* 控制流标签栈 *)
   mutable break_labels: string list;
@@ -189,6 +190,9 @@ type codegen_context = {
   (* 函数信息 *)
   func_name: string;
   mutable used_callee_regs: reg list;  (* 被使用的被调用者保存寄存器 *)
+  
+  (* 作用域管理 *)
+  mutable scope_level: int;  (* 当前作用域级别 *)
 }
 
 (* 创建新的代码生成上下文 *)
@@ -211,6 +215,7 @@ let create_context func_name = {
   spilled_vars = [];
   func_name;
   used_callee_regs = [];
+  scope_level = 0;  (* 初始作用域级别为0 *)
 }
 
 (* 生成新标签 *)
@@ -249,7 +254,7 @@ let find_free_reg ctx prefer_callee =
         List.find_opt (fun (r, used) -> not used && reg_class r = CalleeSaved) ctx.regs_in_use
         |> Option.map fst
 
-(* 溢出寄存器到栈 - 修复：正确的栈偏移计算 *)
+(* 溢出寄存器到栈 *)
 let spill_reg ctx reg =
   let offset = - (ctx.stack_offset + 4) in  (* 使用负偏移，栈向下生长 *)
   ctx.stack_offset <- ctx.stack_offset + 4;
@@ -284,7 +289,7 @@ let allocate_reg ctx prefer_callee =
       set_reg_used ctx reg true;
       reg, spill_instrs
 
-(* 将变量添加到上下文 - 修复：添加活跃状态跟踪 *)
+(* 将变量添加到上下文 - 改进：添加作用域级别 *)
 let add_local_var ctx name start_pos end_pos =
   let var_info = {
     var_name = name;
@@ -292,18 +297,22 @@ let add_local_var ctx name start_pos end_pos =
     var_reg = None;
     stack_offset = None;
     is_active = true;  (* 新变量默认在当前作用域活跃 *)
+    scope_level = ctx.scope_level;  (* 记录当前作用域级别 *)
   } in
   ctx.local_vars <- (name, var_info) :: ctx.local_vars;
   var_info
 
-(* 获取变量信息 *)
+(* 获取变量信息 - 改进：搜索所有活跃的作用域 *)
 let get_var_info ctx name =
-  match List.assoc_opt name ctx.local_vars with
-  | Some info -> 
-      if not info.is_active then
-        failwith (Printf.sprintf "Variable '%s' used outside its scope" name);
-      info
-  | None -> failwith (Printf.sprintf "Variable '%s' not found in scope" name)
+  let rec search_vars = function
+    | [] -> None
+    | (n, info) :: rest ->
+        if n = name && info.is_active then Some info
+        else search_vars rest
+  in
+  match search_vars ctx.local_vars with
+  | Some info -> info
+  | None -> failwith (Printf.sprintf "Variable '%s' not found in scope (current level: %d)" name ctx.scope_level)
 
 (* 为变量分配寄存器 *)
 let allocate_var_reg ctx var_name start_pos end_pos =
@@ -326,17 +335,21 @@ let release_var_reg ctx var_name =
       var_info.var_reg <- None
   | None -> ()
 
-(* 标记变量为不活跃 - 新增：用于块作用域结束时 *)
-let deactivate_vars ctx vars =
-  ctx.local_vars <- List.map (fun (name, info) ->
-    if List.mem name vars then (name, { info with is_active = false })
-    else (name, info)
+(* 标记特定作用域级别的变量为不活跃 *)
+(* 标记特定作用域级别的变量为不活跃 *)
+let deactivate_scope_vars ctx level =
+  ctx.local_vars <- List.map (fun (name, (info : var_info)) ->  (* 显式指定info的类型 *)
+    if info.scope_level = level then 
+      (name, { info with is_active = false })  (* 现在明确知道info是var_info类型 *)
+    else 
+      (name, info)
   ) ctx.local_vars
 
 (* 安全释放变量寄存器的辅助函数 *)
 let safe_release_var_reg ctx expr =
   match expr with
-  | Ast.Var id -> release_var_reg ctx id
+  | Ast.Var id -> 
+      (try release_var_reg ctx id with _ -> ())  (* 忽略未找到的变量 *)
   | _ -> ()
 
 (* 生成表达式代码 *)
@@ -374,6 +387,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       (* 安全释放操作数寄存器 - 只在是变量时才释放 *)
       safe_release_var_reg ctx e;
       result_reg, e_instrs @ alloc_instrs @ op_instrs
+
       
   | Ast.BinOp (e1, op, e2) ->
       let e1_reg, e1_instrs = gen_expr ctx e1 in
@@ -418,7 +432,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
         |> List.map fst
       in
       
-      (* 计算栈空间需求，确保16字节对齐 - 修复：正确的栈对齐计算 *)
+      (* 计算栈空间需求，确保16字节对齐 *)
       let stack_args_space = num_stack_args * 4 in
       let saved_regs_space = List.length caller_regs_to_save * 4 in
       let stack_space = stack_args_space + saved_regs_space in
@@ -477,7 +491,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       
       result_reg, save_instrs @ arg_instrs @ call_instr @ restore_instrs
 
-(* 生成函数序言 - 修复：正确的栈帧初始化 *)
+(* 生成函数序言 *)
 let gen_prologue ctx =
   (* 保存被调用者保存寄存器 *)
   let save_callee_regs =
@@ -489,7 +503,7 @@ let gen_prologue ctx =
   [ Instruction (Addi (Sp, Sp, -ctx.frame_size));  (* 分配栈帧 *)
     Instruction (Sw (Ra, 4, Sp));  (* 保存返回地址 *)
     Instruction (Sw (S0, 0, Sp));  (* 保存旧帧指针 *)
-    Instruction (Addi (S0, Sp, ctx.frame_size)) ]  (* 修复：正确设置帧指针 *)
+    Instruction (Addi (S0, Sp, ctx.frame_size)) ]  (* 设置帧指针 *)
   @ List.map (fun i -> Instruction i) save_callee_regs
 
 (* 生成函数尾声 *)
@@ -507,7 +521,7 @@ let gen_epilogue ctx =
       Instruction (Addi (Sp, Sp, ctx.frame_size));  (* 释放栈帧 *)
       Instruction Ret ]
 
-(* 递归统计声明数量和收集变量名 - 修复：跟踪块内变量 *)
+(* 递归统计声明数量和收集变量名 *)
 let rec count_decls_in_stmt = function
   | Ast.Decl (name, _) -> 1, [name]
   | Ast.Block stmts -> 
@@ -523,7 +537,7 @@ let rec count_decls_in_stmt = function
   | Ast.While (_, s) -> count_decls_in_stmt s
   | _ -> 0, []
 
-(* 计算函数所需的栈帧大小 - 修复：更精确的栈大小计算 *)
+(* 计算函数所需的栈帧大小 *)
 let calculate_frame_size func_def ctx =
   let total_decls, _ = List.fold_left (fun (acc, vars) stmt ->
     let c, v = count_decls_in_stmt stmt in
@@ -547,7 +561,7 @@ let calculate_frame_size func_def ctx =
   ctx.frame_size <- aligned_size;
   aligned_size
 
-(* 生成语句代码 - 修复：块作用域处理 *)
+(* 生成语句代码 - 改进：正确的块作用域处理 *)
 let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
   update_pos ctx;
   match stmt with
@@ -558,26 +572,22 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
       List.map (fun i -> Instruction i) instrs
   
   | Ast.Block stmts ->
-      (* 保存当前变量状态和栈偏移 *)
-      let old_vars = ctx.local_vars in
+      (* 增加作用域级别 *)
+      ctx.scope_level <- ctx.scope_level + 1;
+      let current_level = ctx.scope_level in
+      
+      (* 保存当前栈偏移和最大栈使用量 *)
       let old_offset = ctx.stack_offset in
       let old_max_stack = ctx.max_stack_usage in
-      
-      (* 收集块内声明的变量名 *)
-      let _, block_vars = List.fold_left (fun (_, vars) s ->
-        let _, v = count_decls_in_stmt s in
-        (0, vars @ v)
-      ) (0, []) stmts in
       
       (* 生成块内语句 *)
       let items = List.map (gen_stmt ctx) stmts |> List.flatten in
       
-      (* 释放块内变量使用的寄存器并标记为不活跃 *)
-      List.iter (fun var -> release_var_reg ctx var) block_vars;
-      deactivate_vars ctx block_vars;
+      (* 恢复作用域级别并标记该级别变量为不活跃 *)
+      ctx.scope_level <- ctx.scope_level - 1;
+      deactivate_scope_vars ctx current_level;
       
-      (* 恢复上下文 *)
-      ctx.local_vars <- old_vars;
+      (* 恢复栈偏移和最大栈使用量 *)
       ctx.stack_offset <- old_offset;
       ctx.max_stack_usage <- old_max_stack;
       
@@ -686,7 +696,10 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
         let start_pos = 0 in
         let end_pos = 100 in  (* 简化处理 *)
         ignore (add_local_var ctx name start_pos end_pos)
-    | Ast.Block stmts -> List.iter pre_scan_stmt stmts
+    | Ast.Block stmts -> 
+        ctx.scope_level <- ctx.scope_level + 1;
+        List.iter pre_scan_stmt stmts;
+        ctx.scope_level <- ctx.scope_level - 1
     | Ast.If (_, s1, Some s2) -> pre_scan_stmt s1; pre_scan_stmt s2
     | Ast.If (_, s1, None) -> pre_scan_stmt s1
     | Ast.While (_, s) -> pre_scan_stmt s
