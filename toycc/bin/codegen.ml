@@ -291,6 +291,7 @@ type codegen_context =
   ; mutable local_vars : (string * int) list (* 局部变量映射到栈偏移 *)
   ; func_name : string (* 函数名，用于生成唯一标签 *)
   ; total_locals : int ref (* 总局部变量数量 *)
+  ; param_count : int ref (* 参数数量 - 新增 *)
   }
 
 (* 创建新的代码生成上下文 *)
@@ -303,7 +304,8 @@ let create_context _symbol_table func_name =
     continue_labels = [];
     local_vars = [];
     func_name = func_name;
-    total_locals = ref 0
+    total_locals = ref 0;
+    param_count = ref 0 (* 初始化参数计数器 *)
   }
 
 (* 生成新标签 - 确保全局唯一 *)
@@ -416,11 +418,16 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
   | Ast.Call (fname, args) ->
     let result_reg = A0 in
     (* 计算需要通过栈传递的参数数量 *)
-    let num_stack_args = max 0 (List.length args - 8) in
-    (* 计算栈空间需求 *)
+    let num_args = List.length args in
+    let num_stack_args = max 0 (num_args - 8) in
+    (* 计算栈空间需求：栈参数 + 保存的临时寄存器 + 16字节对齐 *)
     let stack_args_space = num_stack_args * 4 in
     let saved_regs_space = 7 * 4 in (* T0-T6 *)
     let stack_space = stack_args_space + saved_regs_space in
+    let stack_space = 
+      if stack_space mod 16 != 0 then stack_space + (16 - stack_space mod 16) 
+      else stack_space 
+    in
     
     (* 为栈参数和临时寄存器预留空间 *)
     let save_instrs = 
@@ -459,7 +466,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
                in
                arg_code @ [ Mv (target_reg, arg_reg) ]
              else
-               (* 超过8个的参数使用栈传递 *)
+               (* 超过8个的参数使用栈传递 - 修复栈位置计算 *)
                let stack_pos = (i - 8) * 4 + saved_regs_space in
                arg_code @ [ Sw (arg_reg, stack_pos, Sp) ]
            in
@@ -598,8 +605,8 @@ let calculate_frame_size (func_def : Ast.func_def) =
   let num_locals =
     List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
   let num_params = List.length func_def.params in
-  (* ra, fp + S寄存器 + 参数 + 局部变量 + 额外安全空间 *)
-  let required_space = 8 + 44 + (num_params * 4) + (num_locals * 4) + 64 in
+  (* 计算所需栈空间：ra(4) + fp(4) + S寄存器(11个×4) + 参数 + 局部变量 + 调用其他函数时的栈参数空间 *)
+  let required_space = 8 + 44 + (num_params * 4) + (num_locals * 4) + 256 in (* 增加额外空间应对多参数调用 *)
   (* 16字节对齐 *)
   let aligned = (required_space + 15) / 16 * 16 in
   max aligned 64  (* 确保至少64字节的栈帧 *)
@@ -608,6 +615,8 @@ let calculate_frame_size (func_def : Ast.func_def) =
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   (* 为每个函数创建独立上下文 *)
   let ctx = create_context symbol_table func_def.fname in
+  ctx.param_count := List.length func_def.params; (* 记录参数数量 *)
+  
   (* 计算栈帧 *)
   let frame_size = calculate_frame_size func_def in
   (* 函数序言 *)
@@ -634,8 +643,8 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
            in
            [ Instruction (Sw (arg_reg, offset, Fp)) ]
          else
-           (* 超过8个的参数从栈中读取 *)
-           let stack_offset = (i - 8) * 4 + 16 in (* 跳过ra和fp *)
+           (* 超过8个的参数从栈中读取 - 修复栈偏移计算 *)
+           let stack_offset = (i - 8) * 4 + 16 in (* 跳过ra(4)、fp(4)和前8个参数(32)，共40字节? *)
            [ Instruction (Lw (T0, stack_offset, Sp));
              Instruction (Sw (T0, offset, Fp)) ]
        in
