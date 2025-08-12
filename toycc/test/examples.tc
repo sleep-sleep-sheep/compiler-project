@@ -1,5 +1,0 @@
-int main() {
-    int x = 13;
-    x = x + 34;
-    return x;
-}
