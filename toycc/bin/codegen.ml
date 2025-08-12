@@ -194,7 +194,7 @@ let create_context func_name = {
   label_counter = 0;
   temp_counter = 0;
   pos_counter = 0;
-  stack_offset = -8;  (* fp-based offset, 初始为-8以避开ra和fp *)
+  stack_offset = -4;  (* fp-based offset，修复初始偏移值 *)
   frame_size = 0;
   break_labels = [];
   continue_labels = [];
@@ -388,6 +388,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       
   | Ast.Call (fname, args) ->
       let result_reg = A0 in
+      let prev_a0_used = List.assoc A0 ctx.regs_in_use in
       set_reg_used ctx result_reg true;
       
       (* 计算需要通过栈传递的参数数量 *)
@@ -456,6 +457,9 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
           @ [Addi (Sp, Sp, stack_space)]
         else []
       in
+      
+      (* 恢复A0的原始使用状态 *)
+      set_reg_used ctx A0 prev_a0_used;
       
       result_reg, save_instrs @ arg_instrs @ call_instr @ restore_instrs
 
@@ -628,13 +632,17 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
 let gen_function (func_def : Ast.func_def) : asm_item list =
   let ctx = create_context func_def.fname in
   
-  (* 预扫描函数体，收集变量信息（简化版） *)
-  let pre_scan_stmt stmt =
+  (* 预扫描函数体，收集变量信息 *)
+  let rec pre_scan_stmt stmt =
     match stmt with
     | Ast.Decl (name, _) ->
         let start_pos = 0 in
-        let end_pos = 100 in  (* 简化处理，实际应计算真实区间 *)
+        let end_pos = 100 in  (* 简化处理 *)
         ignore (add_local_var ctx name start_pos end_pos)
+    | Ast.Block stmts -> List.iter pre_scan_stmt stmts
+    | Ast.If (_, s1, Some s2) -> pre_scan_stmt s1; pre_scan_stmt s2
+    | Ast.If (_, s1, None) -> pre_scan_stmt s1
+    | Ast.While (_, s) -> pre_scan_stmt s
     | _ -> ()
   in
   
@@ -669,18 +677,22 @@ let gen_function (func_def : Ast.func_def) : asm_item list =
     |> List.flatten
   in
   
+  (* 生成函数体以确定使用的寄存器 *)
+  let _ = List.map (gen_stmt ctx) func_def.body in
+  
   (* 计算栈帧大小 *)
   let _ = calculate_frame_size func_def ctx in
   
-  (* 生成函数序言 *)
-  let prologue = gen_prologue ctx in
-  
-  (* 生成函数体 *)
+  (* 重置位置计数器并重新生成函数体 *)
+  ctx.pos_counter <- 0;
   let body_items =
     func_def.body
     |> List.map (gen_stmt ctx)
     |> List.flatten
   in
+  
+  (* 生成函数序言 *)
+  let prologue = gen_prologue ctx in
   
   (* 检查是否有返回指令，如果没有则添加默认返回 *)
   let has_return =
