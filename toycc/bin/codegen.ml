@@ -71,14 +71,21 @@ let reg_to_string reg =
   | T5 -> "t5"
   | T6 -> "t6"
 
-(* 辅助函数：正确拆分立即数为高位和低位，确保低位在addi范围内 *)
+(* 辅助函数：正确拆分立即数为高位和低位，确保符合RISC-V指令规范 *)
 let split_imm imm =
-  let lower = imm mod 4096 in  (* 取低12位 *)
-  let adjusted_lower = 
-    if lower > 2047 then lower - 4096  (* 转换为12位带符号数 *)
-    else lower 
+  (* 确保立即数在32位有符号范围内 *)
+  let imm32 = imm land 0xFFFFFFFF in
+  (* 提取低12位并符号扩展 *)
+  let lower = imm32 land 0xFFF in
+  let adjusted_lower =
+    if (lower land 0x800) != 0 then  (* 检查符号位 *)
+      lower - 4096  (* 转换为负的12位值 *)
+    else
+      lower
   in
-  let upper = (imm - adjusted_lower) / 4096 in  (* 计算高位 *)
+  (* 计算高位，确保在0..1048575范围内 (20位无符号) *)
+  let upper = (imm32 - adjusted_lower) lsr 12 in
+  let upper = upper land 0xFFFFF in  (* 确保只取20位 *)
   (upper, adjusted_lower)
 
 (* RISC-V 指令类型 *)
@@ -131,7 +138,11 @@ let instr_to_string instr = match instr with
       (reg_to_string rs1)
       (reg_to_string rs2)
   | Addi (rd, rs1, imm) ->
-    Printf.sprintf "addi %s, %s, %d" (reg_to_string rd) (reg_to_string rs1) imm
+    (* 确保addi立即数在-2048到2047范围内 *)
+    if imm < -2048 || imm > 2047 then
+      failwith (Printf.sprintf "Addi immediate out of range: %d" imm)
+    else
+      Printf.sprintf "addi %s, %s, %d" (reg_to_string rd) (reg_to_string rs1) imm
   | Sub (rd, rs1, rs2) ->
     Printf.sprintf "sub %s, %s, %s"
       (reg_to_string rd)
@@ -209,11 +220,21 @@ let instr_to_string instr = match instr with
     if imm >= -2048 && imm <= 2047 then
       Printf.sprintf "li %s, %d" (reg_to_string rd) imm
     else
-      let (upper, lower) = split_imm imm in  (* 使用修正的拆分函数 *)
-      Printf.sprintf "lui %s, %d\n    addi %s, %s, %d"
-        (reg_to_string rd) upper
-        (reg_to_string rd) (reg_to_string rd) lower
-  | Lui (rd, imm) -> Printf.sprintf "lui %s, %d" (reg_to_string rd) imm
+      let (upper, lower) = split_imm imm in
+      (* 确保LUI立即数在合法范围内 *)
+      if upper < 0 || upper > 1048575 then
+        failwith (Printf.sprintf "LUI immediate out of range: %d" upper)
+      else if lower < -2048 || lower > 2047 then
+        failwith (Printf.sprintf "Addi immediate out of range: %d" lower)
+      else
+        Printf.sprintf "lui %s, %d\n    addi %s, %s, %d"
+          (reg_to_string rd) upper
+          (reg_to_string rd) (reg_to_string rd) lower
+  | Lui (rd, imm) -> 
+    if imm < 0 || imm > 1048575 then
+      failwith (Printf.sprintf "LUI immediate out of range: %d" imm)
+    else
+      Printf.sprintf "lui %s, %d" (reg_to_string rd) imm
   | Mv (rd, rs) -> Printf.sprintf "mv %s, %s" (reg_to_string rd) (reg_to_string rs)
   | Nop -> "nop"
 
@@ -343,7 +364,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       if n >= -2048 && n <= 2047 then
         [ Li (reg, n) ]
       else
-        let (upper, lower) = split_imm n in  (* 使用修正的拆分函数 *)
+        let (upper, lower) = split_imm n in
         [ Lui (reg, upper); Addi (reg, reg, lower) ]
     in
     reg, instrs
@@ -363,7 +384,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       | "!" -> e_instrs @ [ Sltiu (result_reg, e_reg, 1) ]
       | _ -> failwith (Printf.sprintf "Unknown unary operator: %s" op)
     in
-    release_temp_reg ctx e_reg;  (* 释放具体的e_reg *)
+    release_temp_reg ctx e_reg;
     result_reg, instrs
   | Ast.BinOp (e1, op, e2) ->
     let e1_reg, e1_instrs = gen_expr ctx e1 in
@@ -389,8 +410,8 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       | _ -> failwith (Printf.sprintf "Unknown binary operator: %s" op)
     in
     let instrs = e1_instrs @ e2_instrs @ op_instrs in
-    release_temp_reg ctx e1_reg;  (* 释放具体的e1_reg *)
-    release_temp_reg ctx e2_reg;  (* 释放具体的e2_reg *)
+    release_temp_reg ctx e1_reg;
+    release_temp_reg ctx e2_reg;
     result_reg, instrs
   | Ast.Call (fname, args) ->
     let result_reg = A0 in
@@ -442,7 +463,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
                let stack_pos = (i - 8) * 4 + saved_regs_space in
                arg_code @ [ Sw (arg_reg, stack_pos, Sp) ]
            in
-           release_temp_reg ctx arg_reg;  (* 释放具体的arg_reg *)
+           release_temp_reg ctx arg_reg;
            instrs)
         args
       |> List.flatten
@@ -489,18 +510,18 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
   | Ast.Empty -> []
   | Ast.ExprStmt e ->
     let reg, instrs = gen_expr ctx e in
-    release_temp_reg ctx reg;  (* 释放表达式使用的寄存器 *)
+    release_temp_reg ctx reg;
     List.map (fun i -> Instruction i) instrs
   | Ast.Block stmts ->
     let old_vars = ctx.local_vars in
     let old_offset = ctx.stack_offset in
     let old_total_locals = !(ctx.total_locals) in
-    let old_temp_regs = ctx.temp_regs in  (* 保存临时寄存器状态 *)
+    let old_temp_regs = ctx.temp_regs in
     let items = List.map (gen_stmt ctx frame_size) stmts |> List.flatten in
     ctx.local_vars <- old_vars;
     ctx.stack_offset <- old_offset;
     ctx.total_locals := old_total_locals;
-    ctx.temp_regs <- old_temp_regs;  (* 恢复临时寄存器状态 *)
+    ctx.temp_regs <- old_temp_regs;
     items
   | Ast.Return (Some e) ->
     (match e with
@@ -510,7 +531,7 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
      | _ ->
        let e_reg, e_instrs = gen_expr ctx e in
        let all_instrs = e_instrs @ [ Mv (A0, e_reg) ] @ gen_epilogue_instrs frame_size in
-       release_temp_reg ctx e_reg;  (* 释放e_reg *)
+       release_temp_reg ctx e_reg;
        List.map (fun i -> Instruction i) all_instrs)
   | Ast.Return None -> List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
   | Ast.If (cond, then_stmt, else_stmt) ->
@@ -523,7 +544,7 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
       | Some s -> gen_stmt ctx frame_size s
       | None -> []
     in
-    release_temp_reg ctx cond_reg;  (* 释放cond_reg *)
+    release_temp_reg ctx cond_reg;
     List.map (fun i -> Instruction i) cond_instrs
     @ [ Instruction (Beq (cond_reg, Zero, else_label)) ]
     @ then_items
@@ -539,7 +560,7 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     let body_items = gen_stmt ctx frame_size body in
     ctx.break_labels <- List.tl ctx.break_labels;
     ctx.continue_labels <- List.tl ctx.continue_labels;
-    release_temp_reg ctx cond_reg;  (* 释放cond_reg *)
+    release_temp_reg ctx cond_reg;
     [ Label loop_label ]
     @ List.map (fun i -> Instruction i) cond_instrs
     @ [ Instruction (Beq (cond_reg, Zero, end_label)) ]
@@ -557,13 +578,13 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     let offset = add_local_var ctx name in
     let e_reg, e_instrs = gen_expr ctx e in
     let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in
-    release_temp_reg ctx e_reg;  (* 释放e_reg *)
+    release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
   | Ast.Assign (name, e) ->
     let offset = get_var_offset ctx name in
     let e_reg, e_instrs = gen_expr ctx e in
     let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in
-    release_temp_reg ctx e_reg;  (* 释放e_reg *)
+    release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
 
 (* 计算函数所需的栈帧大小 *)
@@ -583,11 +604,10 @@ let calculate_frame_size (func_def : Ast.func_def) =
     List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
   let num_params = List.length func_def.params in
   (* ra, fp + 参数 + 局部变量 + 额外安全空间 *)
-  let required_space = 8 + (num_params * 4) + (num_locals * 4) + 64 in (* 增加更大的安全空间 *)
+  let required_space = 8 + (num_params * 4) + (num_locals * 4) + 64 in
   (* 16字节对齐 *)
   let aligned = (required_space + 15) / 16 * 16 in
-  max aligned 64 (* 确保至少64字节的栈帧，适应更多局部变量 *)
-
+  max aligned 64
 (* 生成函数代码 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   (* 为每个函数创建独立上下文 *)
