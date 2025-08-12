@@ -615,15 +615,6 @@ let gen_program symbol_table (program : Ast.program) =
   in
   header @ func_asm_items
 
-(* 修改代码生成函数，使其接受输出通道作为参数 *)
-let compile_to_riscv out_chan symbol_table program =
-  let asm_items = gen_program symbol_table program in
-  (* 将汇编项写入指定的输出通道 *)
-  List.iter
-    (fun item -> 
-      output_string out_chan (asm_item_to_string item);
-      output_char out_chan '\n')  (* 手动添加换行符 *)
-    asm_items
 
 
 (* 修改代码生成函数，使其接受输出通道作为参数 *)
@@ -633,5 +624,6 @@ let compile_to_riscv symbol_table program =
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
 
