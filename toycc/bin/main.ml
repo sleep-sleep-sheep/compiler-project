@@ -36,7 +36,9 @@ let () =
     
     (* 代码生成并输出到标准输出 *)
     (* 假设symbol_table由其他方式获取或不需要，这里直接传递空表或调整参数 *)
-    Codegen.compile_to_riscv [] optimized_ast;  (* 修正：根据实际参数要求调整 *)
+    (*Codegen.compile_to_riscv [] optimized_ast;  (* 修正：根据实际参数要求调整 *)
+    flush stdout*)
+    Codegen.compile_to_stdout optimized_ast;
     flush stdout
     
   with
@@ -46,3 +48,4 @@ let () =
   | e ->
       Printf.eprintf "未知错误: %s\n" (Printexc.to_string e);
       exit 1
+
