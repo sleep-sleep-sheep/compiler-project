@@ -640,8 +640,8 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
            in
            [ Instruction (Sw (arg_reg, offset, Fp)) ]
          else
-           (* 栈参数的偏移计算：frame_size是栈帧总大小，i-8是栈参数索引 *)
-           let stack_offset = frame_size + (i - 8) * 4 in
+           (* 修复栈参数地址计算：第i个参数(i>=8)在调用者栈中的位置 *)
+           let stack_offset = frame_size + 4 * (i - 7) in  (* 关键修复点 *)
            [ Instruction (Lw (T0, stack_offset, Sp));
              Instruction (Sw (T0, offset, Fp)) ]
        in
@@ -695,11 +695,13 @@ let gen_program symbol_table (program : Ast.program) =
   header @ func_asm_items
 
 
+
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
 
 
