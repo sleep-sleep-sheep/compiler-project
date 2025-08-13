@@ -34,7 +34,6 @@ type reg =
   | T4 
   | T5 
   | T6 
-  | S0  (* 新增S0寄存器，与Fp相关 *)
 
 (* 将寄存器转换为字符串 *)
 let reg_to_string reg = 
@@ -48,7 +47,6 @@ let reg_to_string reg =
   | T1 -> "t1"
   | T2 -> "t2"
   | Fp -> "fp"
-  | S0 -> "s0"  (* S0与Fp通常是同一个寄存器 *)
   | S1 -> "s1"
   | A0 -> "a0"
   | A1 -> "a1"
@@ -269,13 +267,19 @@ let get_temp_reg ctx =
       ctx.temp_regs <- rest;
       reg
   | [] ->
-      let regs = [T0; T1; T2; T3; T4; T5; T6] in
-      if ctx.temp_counter < List.length regs then
-        let reg = List.nth regs ctx.temp_counter in
-        ctx.temp_counter <- ctx.temp_counter + 1;
-        reg
-      else
-        failwith "Out of temporary registers - need to implement stack spilling"
+      let reg =
+        match ctx.temp_counter mod 7 with
+        | 0 -> T0
+        | 1 -> T1
+        | 2 -> T2
+        | 3 -> T3
+        | 4 -> T4
+        | 5 -> T5
+        | 6 -> T6
+        | _ -> failwith "Invalid temp reg index"
+      in
+      ctx.temp_counter <- ctx.temp_counter + 1;
+      reg
 
 let release_temp_reg ctx reg =
   (* 防止重复释放同一寄存器 *)
@@ -348,12 +352,12 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
             Sltu (result_reg, Zero, result_reg) ]
       | "<" -> [ Slt (result_reg, e1_reg, e2_reg) ]
       | "<=" -> 
-          [ Slt (result_reg, e2_reg, e1_reg);  (* 修复条件判断逻辑 *)
-            Xori (result_reg, result_reg, 1) ]
+          [ Slt (T0, e2_reg, e1_reg);  (* 使用临时寄存器T0避免冲突 *)
+            Xori (result_reg, T0, 1) ]
       | ">" -> [ Slt (result_reg, e2_reg, e1_reg) ]
       | ">=" -> 
-          [ Slt (result_reg, e1_reg, e2_reg);  (* 修复条件判断逻辑 *)
-            Xori (result_reg, result_reg, 1) ]
+          [ Slt (T0, e1_reg, e2_reg); 
+            Xori (result_reg, T0, 1) ]
       | "&&" ->
           [ Sltu (T0, Zero, e1_reg);  (* e1 != 0 *)
             Sltu (T1, Zero, e2_reg);  (* e2 != 0 *)
@@ -406,8 +410,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
                in
                arg_code @ [ Mv (target_reg, arg_reg) ]
              else
-               (* 修复：栈参数位置计算，符合RISC-V调用约定 *)
-               let stack_pos = (i - 8) * 4 + 20 in  (* 从sp+20开始是第9个参数 *)
+               let stack_pos = (i - 8) * 4 + saved_regs_space in
                arg_code @ [ Sw (arg_reg, stack_pos, Sp) ]
            in
            release_temp_reg ctx arg_reg;  (* 释放参数寄存器 *)
@@ -450,9 +453,7 @@ let gen_epilogue_instrs frame_size =
   ]
 
 let gen_restore_s_regs =
-  [ Lw (S0, -8, Fp);   (* 恢复S0(Fp) *)
-    Lw (S1, -12, Fp);
-    Lw (S2, -16, Fp);
+  [ Lw (S2, -16, Fp);
     Lw (S3, -20, Fp);
     Lw (S4, -24, Fp);
     Lw (S5, -28, Fp);
@@ -554,7 +555,7 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
 
-(* 栈帧大小计算 - 修复多参数情况下的计算 *)
+(* 栈帧大小计算 *)
 let calculate_frame_size (func_def : Ast.func_def) =
   let rec count_decls_in_stmt (stmt:Ast.stmt) =
     match stmt with
@@ -567,15 +568,9 @@ let calculate_frame_size (func_def : Ast.func_def) =
   in
   let num_locals = List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
   let num_params = List.length func_def.params in
-  (* 修复：正确计算所需空间，考虑所有参数和局部变量 *)
-  let param_space = max 0 (num_params - 8) * 4 in  (* 超过8个的参数需要栈空间 *)
-  let local_space = num_locals * 4 in
-  let s_regs_space = 12 * 4 in  (* S0-S11寄存器保存空间 (新增S0) *)
-  let base_space = 8 in  (* ra和fp *)
-  let temp_stack_space = 32 in  (* 为临时变量溢出预留空间 *)
-  let required_space = base_space + s_regs_space + param_space + local_space + temp_stack_space in
+  let required_space = 8 + (num_params * 4) + (num_locals * 4) + 64 in  (* 8字节用于ra和fp *)
   let aligned = (required_space + 15) / 16 * 16 in  (* 16字节对齐 *)
-  max aligned 128  (* 增大最小栈帧大小 *)
+  max aligned 64  (* 最小栈帧大小 *)
 
 (* 函数生成 - 修复参数处理和指令顺序 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
@@ -587,8 +582,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   
   (* 保存S寄存器（被调用者保存寄存器） *)
   let save_s_regs =
-    [ Instruction (Sw (S0, -8, Fp));   (* 保存S0(Fp) *)
-      Instruction (Sw (S1, -12, Fp));
+    [ Instruction (Sw (S1, -12, Fp));
       Instruction (Sw (S2, -16, Fp));
       Instruction (Sw (S3, -20, Fp));
       Instruction (Sw (S4, -24, Fp));
@@ -616,14 +610,13 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
            in
            [ Instruction (Sw (arg_reg, offset, Fp)) ]
          else
-           (* 修复：栈参数偏移计算，符合RISC-V调用约定 *)
-           let stack_offset = (i - 8) * 4 + 16 in  (* 跳过ra(4)、fp(4)和前8个参数(32) *)
+           let stack_offset = (i - 8) * 4 + 16 in  (* 跳过ra和fp *)
            [ Instruction (Lw (T0, stack_offset, Sp));
              Instruction (Sw (T0, offset, Fp)) ]
        in
        instr)
-    func_def.params
-  |> List.flatten
+      func_def.params
+    |> List.flatten
   in
   
   (* 函数体 *)
@@ -642,13 +635,10 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
       body_items
   in
   
-  (* 隐式return处理 - 修复寄存器恢复逻辑 *)
+  (* 隐式return处理 *)
   let epilogue =
     if has_explicit_return then []
-    else 
-      [ Instruction (Li (A0, 0)) ]  (* 默认返回0 *)
-      @ List.map (fun i -> Instruction i) gen_restore_s_regs
-      @ List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
+    else List.map (fun i -> Instruction i) (gen_restore_s_regs @ gen_epilogue_instrs frame_size)
   in
   
   (* 指令顺序：序言 -> 保存S寄存器 -> 参数处理 -> 函数体 -> 隐式return *)
@@ -674,11 +664,13 @@ let gen_program symbol_table (program : Ast.program) =
   header @ func_asm_items
 
 
+
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
 
 
