@@ -172,8 +172,8 @@ let instr_to_string instr = match instr with
       (reg_to_string rd)
       (reg_to_string rs1)
       (reg_to_string rs2)
-  | Andi (rd, rs1, imm) ->  (* 新增：立即数与操作的字符串转换 *)
-    Printf.sprintf "andi %s, %s, 0x%x" (reg_to_string rd) (reg_to_string rs1) imm
+  | Andi (rd, rs1, imm) ->  (* 新增：处理立即数与操作 *)
+    Printf.sprintf "andi %s, %s, %d" (reg_to_string rd) (reg_to_string rs1) imm
   | Or (rd, rs1, rs2) ->
     Printf.sprintf "or %s, %s, %s"
       (reg_to_string rd)
@@ -516,25 +516,19 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
   | Ast.Return (Some e) ->
     (match e with
      | Ast.Literal(IntLit 0) ->
-       let all_instrs = 
-         [ Li (A0, 0);
-           Andi (A0, A0, 0xFF)  (* 添加：A0 mod 256 *)
-         ] @ gen_epilogue_instrs frame_size in
+       (* 对0取模256还是0，但保持一致性添加取模操作 *)
+       let all_instrs = [ Li (A0, 0); Andi (A0, A0, 0xff) ] @ gen_epilogue_instrs frame_size in
        List.map (fun i -> Instruction i) all_instrs
      | _ ->
        let e_reg, e_instrs = gen_expr ctx e in
-       let all_instrs = 
-         e_instrs @ 
-         [ Mv (A0, e_reg);
-           Andi (A0, A0, 0xFF)  (* 添加：A0 mod 256 *)
-         ] @ gen_epilogue_instrs frame_size in
+       (* 添加对返回值的mod 256操作 (使用andi a0, a0, 0xff) *)
+       let all_instrs = e_instrs @ [ Mv (A0, e_reg); Andi (A0, A0, 0xff) ] @ gen_epilogue_instrs frame_size in
        release_temp_reg ctx e_reg;
        List.map (fun i -> Instruction i) all_instrs)
   | Ast.Return None -> 
-    let all_instrs = 
-      [ Andi (A0, A0, 0xFF)  (* 添加：A0 mod 256 *)
-      ] @ gen_epilogue_instrs frame_size in
-    List.map (fun i -> Instruction i) all_instrs
+    (* 对于无返回值的情况，默认返回0并取模 *)
+    let base_instrs = [ Li (A0, 0); Andi (A0, A0, 0xff) ] @ gen_epilogue_instrs frame_size in
+    List.map (fun i -> Instruction i) base_instrs
   | Ast.If (cond, then_stmt, else_stmt) ->
     let cond_reg, cond_instrs = gen_expr ctx cond in
     let else_label = new_label ctx "else" in
@@ -606,7 +600,7 @@ let calculate_frame_size (func_def : Ast.func_def) =
   let required_space = 8 + (num_params * 4) + (num_locals * 4) + 40 + 64 in
   (* 16字节对齐 *)
   let aligned = (required_space + 15) / 16 * 16 in
-  max aligned 64  (* 最小栈帧64字节 *)
+  max aligned 256  (* 最小栈帧64字节 *)
 
 (* 生成函数代码 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
@@ -682,7 +676,9 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
         body_items
     in
     if has_ret then []
-    else List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
+    else 
+      (* 自动添加的返回值也需要mod 256 *)
+      List.map (fun i -> Instruction i) ([Li (A0, 0); Andi (A0, A0, 0xff)] @ gen_epilogue_instrs frame_size)
   in
   
   [ Label func_def.fname; Comment ("Function: " ^ func_def.fname) ]
@@ -694,7 +690,7 @@ let gen_program symbol_table (program : Ast.program) =
     [ Directive ".text"; 
       Directive ".globl main"; 
       Directive ".align 2";
-      Comment "ToyC Compiler Generated Code with final result mod 256" ]
+      Comment "ToyC Compiler Generated Code - 所有返回值自动mod 256" ]
   in
   let func_asm_items =
     List.map
