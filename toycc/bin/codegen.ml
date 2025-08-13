@@ -245,7 +245,7 @@ type codegen_context =
 let create_context _symbol_table func_name =
   { label_counter = 0;
     temp_counter = 0;
-    temp_regs = [];
+    temp_regs = [T0; T1; T2; T3; T4; T5; T6];  (* 初始化所有临时寄存器为可用 *)
     stack_offset = -8;  (* 从fp下方开始分配 *)
     break_labels = [];
     continue_labels = [];
@@ -267,19 +267,7 @@ let get_temp_reg ctx =
       ctx.temp_regs <- rest;
       reg
   | [] ->
-      let reg =
-        match ctx.temp_counter mod 7 with
-        | 0 -> T0
-        | 1 -> T1
-        | 2 -> T2
-        | 3 -> T3
-        | 4 -> T4
-        | 5 -> T5
-        | 6 -> T6
-        | _ -> failwith "Invalid temp reg index"
-      in
-      ctx.temp_counter <- ctx.temp_counter + 1;
-      reg
+      failwith "Out of temporary registers! Consider optimizing register usage."
 
 let release_temp_reg ctx reg =
   (* 防止重复释放同一寄存器 *)
@@ -337,6 +325,8 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let e1_reg, e1_instrs = gen_expr ctx e1 in
     let e2_reg, e2_instrs = gen_expr ctx e2 in
     let result_reg = get_temp_reg ctx in
+    
+    (* 修复：使用动态分配的临时寄存器而非硬编码的T0/T1 *)
     let op_instrs =
       match op with
       | "+" -> [ Add (result_reg, e1_reg, e2_reg) ]
@@ -352,19 +342,42 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
             Sltu (result_reg, Zero, result_reg) ]
       | "<" -> [ Slt (result_reg, e1_reg, e2_reg) ]
       | "<=" -> 
-          [ Slt (T0, e2_reg, e1_reg);  (* 使用临时寄存器T0避免冲突 *)
-            Xori (result_reg, T0, 1) ]
+          let temp = get_temp_reg ctx in
+          let instrs =
+            [ Slt (temp, e2_reg, e1_reg);  (* 使用动态分配的临时寄存器 *)
+              Xori (result_reg, temp, 1) ]
+          in
+          release_temp_reg ctx temp;  (* 移到指令列表之外释放 *)
+          instrs
       | ">" -> [ Slt (result_reg, e2_reg, e1_reg) ]
       | ">=" -> 
-          [ Slt (T0, e1_reg, e2_reg); 
-            Xori (result_reg, T0, 1) ]
+          let temp = get_temp_reg ctx in
+          let instrs =
+            [ Slt (temp, e1_reg, e2_reg); 
+              Xori (result_reg, temp, 1) ]
+          in
+          release_temp_reg ctx temp;  (* 移到指令列表之外释放 *)
+          instrs
       | "&&" ->
-          [ Sltu (T0, Zero, e1_reg);  (* e1 != 0 *)
-            Sltu (T1, Zero, e2_reg);  (* e2 != 0 *)
-            And (result_reg, T0, T1) ]
+          let temp1 = get_temp_reg ctx in
+          let temp2 = get_temp_reg ctx in
+          let instrs =
+            [ Sltu (temp1, Zero, e1_reg);  (* e1 != 0 *)
+              Sltu (temp2, Zero, e2_reg);  (* e2 != 0 *)
+              And (result_reg, temp1, temp2) ]
+          in
+          release_temp_reg ctx temp1;  (* 移到指令列表之外释放 *)
+          release_temp_reg ctx temp2;  (* 移到指令列表之外释放 *)
+          instrs
       | "||" ->
-          [ Or (T0, e1_reg, e2_reg);   (* e1 | e2 *)
-            Sltu (result_reg, Zero, T0) ]  (* 结果 != 0 *)
+          let temp = get_temp_reg ctx in
+          let instrs =
+            [ Or (temp, e1_reg, e2_reg);   (* e1 | e2 *)
+              Sltu (result_reg, Zero, temp) ]  (* 结果 != 0 *)
+          in
+          release_temp_reg ctx temp;  (* 移到指令列表之外释放 *)
+          instrs
+
       | _ -> failwith (Printf.sprintf "Unknown binary operator: %s" op)
     in
     let instrs = e1_instrs @ e2_instrs @ op_instrs in
@@ -380,6 +393,12 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let stack_args_space = num_stack_args * 4 in
     let saved_regs_space = 7 * 4 in  (* T0-T6 *)
     let stack_space = stack_args_space + saved_regs_space in
+    
+    (* 栈对齐到16字节边界 *)
+    let stack_space = 
+      if stack_space mod 16 = 0 then stack_space 
+      else stack_space + (16 - stack_space mod 16)
+    in
     
     (* 保存临时寄存器 *)
     let save_instrs = 
@@ -555,7 +574,7 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
 
-(* 栈帧大小计算 *)
+(* 栈帧大小计算 - 修复对齐和大小计算 *)
 let calculate_frame_size (func_def : Ast.func_def) =
   let rec count_decls_in_stmt (stmt:Ast.stmt) =
     match stmt with
@@ -568,9 +587,11 @@ let calculate_frame_size (func_def : Ast.func_def) =
   in
   let num_locals = List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
   let num_params = List.length func_def.params in
-  let required_space = 8 + (num_params * 4) + (num_locals * 4) + 64 in  (* 8字节用于ra和fp *)
-  let aligned = (required_space + 15) / 16 * 16 in  (* 16字节对齐 *)
-  max aligned 64  (* 最小栈帧大小 *)
+  (* 计算所需空间：ra(4) + fp(4) + s寄存器(11*4) + 参数 + 局部变量 *)
+  let required_space = 8 + (11 * 4) + (num_params * 4) + (num_locals * 4) in
+  (* 确保栈帧大小是16的倍数以满足RISC-V对齐要求 *)
+  let aligned = (required_space + 15) / 16 * 16 in
+  max aligned 256  (* 最小栈帧大小 *)
 
 (* 函数生成 - 修复参数处理和指令顺序 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
@@ -610,7 +631,8 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
            in
            [ Instruction (Sw (arg_reg, offset, Fp)) ]
          else
-           let stack_offset = (i - 8) * 4 + 16 in  (* 跳过ra和fp *)
+           (* 修复：栈上参数的偏移计算，考虑已保存的ra和fp *)
+           let stack_offset = (i - 8) * 4 + frame_size in
            [ Instruction (Lw (T0, stack_offset, Sp));
              Instruction (Sw (T0, offset, Fp)) ]
        in
@@ -664,12 +686,12 @@ let gen_program symbol_table (program : Ast.program) =
   header @ func_asm_items
 
 
-
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
 
 
