@@ -41,9 +41,13 @@ let () =
     
     
   with
+  | Parsing.Parse_error ->
+      Printf.eprintf "语法解析错误\n";
+      exit 1
   | Sys_error msg ->
       Printf.eprintf "系统错误: %s\n" msg;
       exit 1
   | e ->
       Printf.eprintf "未知错误: %s\n" (Printexc.to_string e);
       exit 1
+
