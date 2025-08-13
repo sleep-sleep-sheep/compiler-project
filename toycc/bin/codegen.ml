@@ -702,7 +702,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
     then []
     else 
       (* 添加默认返回0的指令 *)
-      [ Instruction (Li (A0, 6)) ] @ List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
+      [ Instruction (Li (A0, 0)) ] @ List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
   in
   
   (* 组合所有部分：序言 -> 保存S寄存器 -> 参数处理 -> 函数体 -> 恢复S寄存器 -> 尾声 *)
@@ -734,4 +734,5 @@ let compile_to_riscv symbol_table program =
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
