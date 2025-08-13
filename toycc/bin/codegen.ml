@@ -73,16 +73,23 @@ let reg_to_string reg =
 
 (* 辅助函数：正确拆分立即数为高位和低位，确保符合RISC-V指令规范 *)
 let split_imm imm =
-  let imm32 = imm land 0xFFFFFFFF in
+  (* 确保imm是32位有符号整数 *)
+  let imm32 = 
+    if imm > 0x7FFFFFFF then imm - 0x100000000
+    else if imm < -0x80000000 then imm + 0x100000000
+    else imm
+  in
+  (* 提取低12位并处理符号扩展 *)
   let lower = imm32 land 0xFFF in
   let adjusted_lower =
-    if (lower land 0x800) != 0 then
-      lower - 4096
+    if (lower land 0x800) != 0 then  (* 第11位为1，需要符号扩展 *)
+      lower - 0x1000  (* 转换为负数 *)
     else
       lower
   in
+  (* 计算高位部分 (20位) *)
   let upper = (imm32 - adjusted_lower) lsr 12 in
-  let upper = upper land 0xFFFFF in
+  let upper = upper land 0xFFFFF in  (* 确保是20位 *)
   (upper, adjusted_lower)
 
 (* RISC-V 指令类型 *)
@@ -217,9 +224,9 @@ let instr_to_string instr = match instr with
     else
       let (upper, lower) = split_imm imm in
       if upper < 0 || upper > 1048575 then
-        failwith (Printf.sprintf "LUI immediate out of range: %d" upper)
+        failwith (Printf.sprintf "LUI immediate out of range: %d (original: %d)" upper imm)
       else if lower < -2048 || lower > 2047 then
-        failwith (Printf.sprintf "Addi immediate out of range: %d" lower)
+        failwith (Printf.sprintf "Addi immediate out of range: %d (original: %d)" lower imm)
       else
         Printf.sprintf "lui %s, %d\n    addi %s, %s, %d"
           (reg_to_string rd) upper
@@ -411,7 +418,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let saved_regs_space = 7 * 4 in (* T0-T6 *)
     let stack_space = stack_args_space + saved_regs_space in
     
-    (* 修复：正确保存临时寄存器到栈的低地址 *)
+    (* 保存临时寄存器到栈的低地址 *)
     let save_instrs = 
       if stack_space > 0 then
         Addi (Sp, Sp, -stack_space) ::
@@ -440,7 +447,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
                in
                arg_code @ [ Mv (target_reg, arg_reg) ]
              else
-               (* 修复：栈参数放在保存的寄存器上方 *)
+               (* 栈参数放在保存的寄存器上方 *)
                let stack_pos = saved_regs_space + (i - 8) * 4 in
                arg_code @ [ Sw (arg_reg, stack_pos, Sp) ]
            in
@@ -452,7 +459,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     
     let call_instr = [ Jal (Ra, fname) ] in
     
-    (* 修复：正确恢复临时寄存器 *)
+    (* 恢复临时寄存器 *)
     let restore_instrs =
       if stack_space > 0 then
         [ Lw (T0, 0, Sp);
@@ -593,7 +600,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   let frame_size = calculate_frame_size func_def in
   let prologue = gen_prologue_instrs frame_size  in
   
-  (* 修复：正确处理超过8个的参数，从Fp读取 *)
+  (* 处理超过8个的参数，从Fp读取 *)
   let param_instrs =
     List.mapi
       (fun i { Ast.pname = name; _ } ->
