@@ -71,19 +71,15 @@ let reg_to_string reg =
   | T5 -> "t5"
   | T6 -> "t6"
 
-(* 辅助函数：正确拆分立即数为高位和低位，确保符合RISC-V指令规范 *)
+(* 辅助函数：正确拆分立即数为高位和低位 *)
 let split_imm imm =
   let imm32 = imm land 0xFFFFFFFF in
   let lower = imm32 land 0xFFF in
   let adjusted_lower =
-    if (lower land 0x800) != 0 then
-      lower - 4096
-    else
-      lower
+    if (lower land 0x800) != 0 then lower - 4096 else lower
   in
   let upper = (imm32 - adjusted_lower) lsr 12 in
-  let upper = upper land 0xFFFFF in
-  (upper, adjusted_lower)
+  (upper land 0xFFFFF, adjusted_lower)
 
 (* RISC-V 指令类型 *)
 type instruction =
@@ -107,8 +103,6 @@ type instruction =
   | Bne of reg * reg * string 
   | Blt of reg * reg * string 
   | Bge of reg * reg * string 
-  | Ble of reg * reg * string 
-  | Bgt of reg * reg * string 
   | J of string 
   | Jal of reg * string 
   | Jalr of reg * reg * int 
@@ -122,9 +116,7 @@ type instruction =
 let instr_to_string instr = match instr with
   | Add (rd, rs1, rs2) ->
     Printf.sprintf "add %s, %s, %s"
-      (reg_to_string rd)
-      (reg_to_string rs1)
-      (reg_to_string rs2)
+      (reg_to_string rd) (reg_to_string rs1) (reg_to_string rs2)
   | Addi (rd, rs1, imm) ->
     if imm < -2048 || imm > 2047 then
       failwith (Printf.sprintf "Addi immediate out of range: %d" imm)
@@ -132,53 +124,35 @@ let instr_to_string instr = match instr with
       Printf.sprintf "addi %s, %s, %d" (reg_to_string rd) (reg_to_string rs1) imm
   | Sub (rd, rs1, rs2) ->
     Printf.sprintf "sub %s, %s, %s"
-      (reg_to_string rd)
-      (reg_to_string rs1)
-      (reg_to_string rs2)
+      (reg_to_string rd) (reg_to_string rs1) (reg_to_string rs2)
   | Mul (rd, rs1, rs2) ->
     Printf.sprintf "mul %s, %s, %s"
-      (reg_to_string rd)
-      (reg_to_string rs1)
-      (reg_to_string rs2)
+      (reg_to_string rd) (reg_to_string rs1) (reg_to_string rs2)
   | Div (rd, rs1, rs2) ->
     Printf.sprintf "div %s, %s, %s"
-      (reg_to_string rd)
-      (reg_to_string rs1)
-      (reg_to_string rs2)
+      (reg_to_string rd) (reg_to_string rs1) (reg_to_string rs2)
   | Rem (rd, rs1, rs2) ->
     Printf.sprintf "rem %s, %s, %s"
-      (reg_to_string rd)
-      (reg_to_string rs1)
-      (reg_to_string rs2)
+      (reg_to_string rd) (reg_to_string rs1) (reg_to_string rs2)
   | And (rd, rs1, rs2) ->
     Printf.sprintf "and %s, %s, %s"
-      (reg_to_string rd)
-      (reg_to_string rs1)
-      (reg_to_string rs2)
+      (reg_to_string rd) (reg_to_string rs1) (reg_to_string rs2)
   | Or (rd, rs1, rs2) ->
     Printf.sprintf "or %s, %s, %s"
-      (reg_to_string rd)
-      (reg_to_string rs1)
-      (reg_to_string rs2)
+      (reg_to_string rd) (reg_to_string rs1) (reg_to_string rs2)
   | Xor (rd, rs1, rs2) ->
     Printf.sprintf "xor %s, %s, %s"
-      (reg_to_string rd)
-      (reg_to_string rs1)
-      (reg_to_string rs2)
+      (reg_to_string rd) (reg_to_string rs1) (reg_to_string rs2)
   | Xori (rd, rs1, imm) ->
     Printf.sprintf "xori %s, %s, %d" (reg_to_string rd) (reg_to_string rs1) imm
   | Slt (rd, rs1, rs2) ->
     Printf.sprintf "slt %s, %s, %s"
-      (reg_to_string rd)
-      (reg_to_string rs1)
-      (reg_to_string rs2)
+      (reg_to_string rd) (reg_to_string rs1) (reg_to_string rs2)
   | Slti (rd, rs1, imm) ->
     Printf.sprintf "slti %s, %s, %d" (reg_to_string rd) (reg_to_string rs1) imm
   | Sltu (rd, rs1, rs2) ->
     Printf.sprintf "sltu %s, %s, %s"
-      (reg_to_string rd)
-      (reg_to_string rs1)
-      (reg_to_string rs2)
+      (reg_to_string rd) (reg_to_string rs1) (reg_to_string rs2)
   | Sltiu (rd, rs1, imm) ->
     Printf.sprintf "sltiu %s, %s, %d" (reg_to_string rd) (reg_to_string rs1) imm
   | Lw (rd, offset, rs1) ->
@@ -193,10 +167,6 @@ let instr_to_string instr = match instr with
     Printf.sprintf "blt %s, %s, %s" (reg_to_string rs1) (reg_to_string rs2) label
   | Bge (rs1, rs2, label) ->
     Printf.sprintf "bge %s, %s, %s" (reg_to_string rs1) (reg_to_string rs2) label
-  | Ble (rs1, rs2, label) ->
-    Printf.sprintf "ble %s, %s, %s" (reg_to_string rs1) (reg_to_string rs2) label
-  | Bgt (rs1, rs2, label) ->
-    Printf.sprintf "bgt %s, %s, %s" (reg_to_string rs1) (reg_to_string rs2) label
   | J label -> Printf.sprintf "j %s" label
   | Jal (rd, label) -> Printf.sprintf "jal %s, %s" (reg_to_string rd) label
   | Jalr (rd, rs1, offset) ->
@@ -223,10 +193,9 @@ let instr_to_string instr = match instr with
   | Mv (rd, rs) -> Printf.sprintf "mv %s, %s" (reg_to_string rd) (reg_to_string rs)
   | Nop -> "nop"
 
-(* 标签 *)
+(* 标签和汇编代码项 *)
 type label = string
 
-(* 汇编代码项 *)
 type asm_item =
   | Label of label
   | Instruction of instruction
@@ -247,7 +216,7 @@ let asm_item_to_string item = match item with
   | Directive d -> "    " ^ d
   | Comment c -> "    # " ^ c
 
-(* 输出汇编代码到文件 *)
+(* 输出汇编代码 *)
 let emit_asm_to_file filepath asm_items =
   let file = open_out filepath in
   List.iter
@@ -257,18 +226,14 @@ let emit_asm_to_file filepath asm_items =
     asm_items;
   close_out file
 
-(* 输出汇编代码到标准输出 *)
 let emit_asm_to_stdout asm_items =
-  List.iter
-    (fun item ->
-       print_endline (asm_item_to_string item))
-    asm_items
+  List.iter (fun item -> print_endline (asm_item_to_string item)) asm_items
 
-(* 代码生成上下文 *)
+(* 代码生成上下文 - 增强寄存器管理 *)
 type codegen_context =
   { mutable label_counter : int
   ; mutable temp_counter : int
-  ; mutable temp_regs : reg list
+  ; mutable temp_regs : reg list  (* 可用临时寄存器栈 *)
   ; mutable stack_offset : int
   ; mutable break_labels : string list
   ; mutable continue_labels : string list
@@ -277,12 +242,11 @@ type codegen_context =
   ; total_locals : int ref
   }
 
-(* 创建新的代码生成上下文 *)
 let create_context _symbol_table func_name =
   { label_counter = 0;
     temp_counter = 0;
     temp_regs = [];
-    stack_offset = -8;
+    stack_offset = -8;  (* 从fp下方开始分配 *)
     break_labels = [];
     continue_labels = [];
     local_vars = [];
@@ -296,7 +260,7 @@ let new_label ctx prefix =
   ctx.label_counter <- ctx.label_counter + 1;
   label
 
-(* 获取临时寄存器 *)
+(* 改进的临时寄存器管理 - 确保正确分配和释放 *)
 let get_temp_reg ctx =
   match ctx.temp_regs with
   | reg :: rest ->
@@ -312,50 +276,49 @@ let get_temp_reg ctx =
         | 4 -> T4
         | 5 -> T5
         | 6 -> T6
-        | _ -> failwith "Should not happen"
+        | _ -> failwith "Invalid temp reg index"
       in
       ctx.temp_counter <- ctx.temp_counter + 1;
       reg
 
-(* 释放临时寄存器 *)
 let release_temp_reg ctx reg =
-  ctx.temp_regs <- reg :: ctx.temp_regs
+  (* 防止重复释放同一寄存器 *)
+  if not (List.mem reg ctx.temp_regs) then
+    ctx.temp_regs <- reg :: ctx.temp_regs
 
-(* 将变量添加到栈中 *)
+(* 变量栈管理 *)
 let add_local_var ctx name =
   ctx.stack_offset <- ctx.stack_offset - 4;
   ctx.local_vars <- (name, ctx.stack_offset) :: ctx.local_vars;
   ctx.total_locals := !(ctx.total_locals) + 1;
   ctx.stack_offset
 
-(* 获取变量的栈偏移 *)
 let get_var_offset ctx name =
   match List.assoc_opt name ctx.local_vars with
   | Some offset -> offset
   | None -> 
-      failwith (Printf.sprintf "Variable '%s' not found in scope (available: %s)"
-        name 
-        (String.concat ", " (List.map fst ctx.local_vars)))
+      failwith (Printf.sprintf "Variable '%s' not found in scope" name)
 
-(* 生成表达式代码 *)
+(* 核心修复：表达式生成逻辑 - 确保操作数使用不同寄存器 *)
 let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
   match expr with
   | Ast.Literal(IntLit n) ->
     let reg = get_temp_reg ctx in
     let instrs =
-      if n >= -2048 && n <= 2047 then
-        [ Li (reg, n) ]
+      if n >= -2048 && n <= 2047 then [ Li (reg, n) ]
       else
         let (upper, lower) = split_imm n in
         [ Lui (reg, upper); Addi (reg, reg, lower) ]
     in
     reg, instrs
+
   | Ast.Var id ->
     let reg = get_temp_reg ctx in
     let offset = get_var_offset ctx id in
-    let instr = [ Lw (reg, offset, Fp) ] in
-    reg, instr
+    reg, [ Lw (reg, offset, Fp) ]
+
   | Ast.Paren e -> gen_expr ctx e
+
   | Ast.UnOp (op, e) ->
     let e_reg, e_instrs = gen_expr ctx e in
     let result_reg = get_temp_reg ctx in
@@ -368,7 +331,9 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     in
     release_temp_reg ctx e_reg;
     result_reg, instrs
+
   | Ast.BinOp (e1, op, e2) ->
+    (* 修复核心：确保e1和e2使用独立寄存器，避免冲突 *)
     let e1_reg, e1_instrs = gen_expr ctx e1 in
     let e2_reg, e2_instrs = gen_expr ctx e2 in
     let result_reg = get_temp_reg ctx in
@@ -379,29 +344,44 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       | "*" -> [ Mul (result_reg, e1_reg, e2_reg) ]
       | "/" -> [ Div (result_reg, e1_reg, e2_reg) ]
       | "%" -> [ Rem (result_reg, e1_reg, e2_reg) ]
-      | "==" ->  [ Sub (result_reg, e1_reg, e2_reg); Sltiu (result_reg, result_reg, 1) ]
-      | "!=" -> [ Sub (result_reg, e1_reg, e2_reg); Sltu (result_reg, Zero, result_reg) ]
+      | "==" ->  
+          [ Sub (result_reg, e1_reg, e2_reg); 
+            Sltiu (result_reg, result_reg, 1) ]
+      | "!=" -> 
+          [ Sub (result_reg, e1_reg, e2_reg); 
+            Sltu (result_reg, Zero, result_reg) ]
       | "<" -> [ Slt (result_reg, e1_reg, e2_reg) ]
-      | "<=" -> [ Slt (result_reg, e2_reg, e1_reg); Xori (result_reg, result_reg, 1) ]
+      | "<=" -> 
+          [ Slt (T0, e2_reg, e1_reg);  (* 使用临时寄存器T0避免冲突 *)
+            Xori (result_reg, T0, 1) ]
       | ">" -> [ Slt (result_reg, e2_reg, e1_reg) ]
-      | ">=" -> [ Slt (result_reg, e1_reg, e2_reg); Xori (result_reg, result_reg, 1) ]
+      | ">=" -> 
+          [ Slt (T0, e1_reg, e2_reg); 
+            Xori (result_reg, T0, 1) ]
       | "&&" ->
-        [ Sltu (T0, Zero, e1_reg); Sltu (T1, Zero, e2_reg); And (result_reg, T0, T1) ]
+          [ Sltu (T0, Zero, e1_reg);  (* e1 != 0 *)
+            Sltu (T1, Zero, e2_reg);  (* e2 != 0 *)
+            And (result_reg, T0, T1) ]
       | "||" ->
-        [ Or (result_reg, e1_reg, e2_reg); Sltu (result_reg, Zero, result_reg) ]
+          [ Or (T0, e1_reg, e2_reg);   (* e1 | e2 *)
+            Sltu (result_reg, Zero, T0) ]  (* 结果 != 0 *)
       | _ -> failwith (Printf.sprintf "Unknown binary operator: %s" op)
     in
     let instrs = e1_instrs @ e2_instrs @ op_instrs in
+    (* 释放操作数寄存器，保留结果寄存器 *)
     release_temp_reg ctx e1_reg;
     release_temp_reg ctx e2_reg;
     result_reg, instrs
+
   | Ast.Call (fname, args) ->
-    let result_reg = A0 in
-    let num_stack_args = max 0 (List.length args - 8) in
+    let result_reg = A0 in  (* 函数返回值存在A0 *)
+    let num_args = List.length args in
+    let num_stack_args = max 0 (num_args - 8) in
     let stack_args_space = num_stack_args * 4 in
-    let saved_regs_space = 7 * 4 in
+    let saved_regs_space = 7 * 4 in  (* T0-T6 *)
     let stack_space = stack_args_space + saved_regs_space in
     
+    (* 保存临时寄存器 *)
     let save_instrs = 
       if stack_space > 0 then
         Addi (Sp, Sp, -stack_space) ::
@@ -415,6 +395,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       else []
     in
     
+    (* 处理参数 - 前8个用A0-A7，其余入栈 *)
     let arg_instrs =
       List.mapi
         (fun i arg ->
@@ -432,12 +413,13 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
                let stack_pos = (i - 8) * 4 + saved_regs_space in
                arg_code @ [ Sw (arg_reg, stack_pos, Sp) ]
            in
-           release_temp_reg ctx arg_reg;
+           release_temp_reg ctx arg_reg;  (* 释放参数寄存器 *)
            instrs)
         args
       |> List.flatten
     in
     
+    (* 函数调用和恢复现场 *)
     let call_instr = [ Jal (Ra, fname) ] in
     
     let restore_instrs =
@@ -455,7 +437,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     
     result_reg, save_instrs @ arg_instrs @ call_instr @ restore_instrs   
 
-(* 生成序言 *)
+(* 函数序言和尾声 *)
 let gen_prologue_instrs frame_size =
   [ Instruction(Addi (Sp, Sp, -frame_size));
     Instruction(Sw (Ra, frame_size - 4, Sp));
@@ -463,7 +445,6 @@ let gen_prologue_instrs frame_size =
     Instruction(Addi (Fp, Sp, frame_size))
   ]
 
-(* 生成尾声 *)
 let gen_epilogue_instrs frame_size =
   [ Lw (Ra, frame_size - 4, Sp);
     Lw (Fp, frame_size - 8, Sp); 
@@ -471,7 +452,6 @@ let gen_epilogue_instrs frame_size =
     Ret
   ]
 
-(* 恢复S寄存器的专用函数 *)
 let gen_restore_s_regs =
   [ Lw (S2, -16, Fp);
     Lw (S3, -20, Fp);
@@ -484,50 +464,49 @@ let gen_restore_s_regs =
     Lw (S10, -48, Fp);
     Lw (S11, -52, Fp) ]
 
-(* 生成语句代码 - 修复return指令顺序问题 *)
+(* 语句生成逻辑 - 修复返回值处理 *)
 let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
   match stmt with
   | Ast.Empty -> []
+  
   | Ast.ExprStmt e ->
     let reg, instrs = gen_expr ctx e in
-    release_temp_reg ctx reg;
+    release_temp_reg ctx reg;  (* 释放表达式结果寄存器 *)
     List.map (fun i -> Instruction i) instrs
+  
   | Ast.Block stmts ->
     let old_vars = ctx.local_vars in
     let old_offset = ctx.stack_offset in
     let old_total_locals = !(ctx.total_locals) in
     let old_temp_regs = ctx.temp_regs in
     let items = List.map (gen_stmt ctx frame_size) stmts |> List.flatten in
+    (* 恢复块结束后的上下文 *)
     ctx.local_vars <- old_vars;
     ctx.stack_offset <- old_offset;
     ctx.total_locals := old_total_locals;
     ctx.temp_regs <- old_temp_regs;
     items
+  
   | Ast.Return (Some e) ->
-    (match e with
-     | Ast.Literal(IntLit 0) ->
-       (* 显式return：先恢复S寄存器，再执行尾声 *)
-       let all_instrs = [ Li (A0, 0) ] @ gen_restore_s_regs @ gen_epilogue_instrs frame_size in
-       List.map (fun i -> Instruction i) all_instrs
-     | _ ->
-       let e_reg, e_instrs = gen_expr ctx e in
-       (* 显式return：先恢复S寄存器，再执行尾声 *)
-       let all_instrs = e_instrs @ [ Mv (A0, e_reg) ] @ gen_restore_s_regs @ gen_epilogue_instrs frame_size in
-       release_temp_reg ctx e_reg;
-       List.map (fun i -> Instruction i) all_instrs)
+    let e_reg, e_instrs = gen_expr ctx e in
+    (* 正确设置返回值到A0，然后恢复寄存器并返回 *)
+    let all_instrs = 
+      e_instrs @ [ Mv (A0, e_reg) ] @ gen_restore_s_regs @ gen_epilogue_instrs frame_size 
+    in
+    release_temp_reg ctx e_reg;
+    List.map (fun i -> Instruction i) all_instrs
+  
   | Ast.Return None -> 
-      (* 显式return：先恢复S寄存器，再执行尾声 *)
-      List.map (fun i -> Instruction i) (gen_restore_s_regs @ gen_epilogue_instrs frame_size)
+    (* 无返回值默认返回0 *)
+    List.map (fun i -> Instruction i) 
+      ([ Li (A0, 0) ] @ gen_restore_s_regs @ gen_epilogue_instrs frame_size)
+  
   | Ast.If (cond, then_stmt, else_stmt) ->
     let cond_reg, cond_instrs = gen_expr ctx cond in
     let else_label = new_label ctx "else" in
     let end_label = new_label ctx "endif" in
     let then_items = gen_stmt ctx frame_size then_stmt in
-    let else_items =
-      match else_stmt with
-      | Some s -> gen_stmt ctx frame_size s
-      | None -> []
-    in
+    let else_items = Option.value ~default:[] (Option.map (gen_stmt ctx frame_size) else_stmt) in
     release_temp_reg ctx cond_reg;
     List.map (fun i -> Instruction i) cond_instrs
     @ [ Instruction (Beq (cond_reg, Zero, else_label)) ]
@@ -535,6 +514,7 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     @ [ Instruction (J end_label); Label else_label ]
     @ else_items
     @ [ Label end_label ]
+  
   | Ast.While (cond, body) ->
     let loop_label = new_label ctx "loop" in
     let end_label = new_label ctx "endloop" in
@@ -550,20 +530,24 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     @ [ Instruction (Beq (cond_reg, Zero, end_label)) ]
     @ body_items
     @ [ Instruction (J loop_label); Label end_label ]
+  
   | Ast.Break ->
     (match ctx.break_labels with
      | label :: _ -> [ Instruction (J label) ]
      | [] -> failwith "Break outside loop")
+  
   | Ast.Continue ->
     (match ctx.continue_labels with
      | label :: _ -> [ Instruction (J label) ]
      | [] -> failwith "Continue outside loop")
+  
   | Ast.Decl (name, e) ->
     let offset = add_local_var ctx name in
     let e_reg, e_instrs = gen_expr ctx e in
     let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in
     release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
+  
   | Ast.Assign (name, e) ->
     let offset = get_var_offset ctx name in
     let e_reg, e_instrs = gen_expr ctx e in
@@ -571,7 +555,7 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
     release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
 
-(* 计算函数所需的栈帧大小 *)
+(* 栈帧大小计算 *)
 let calculate_frame_size (func_def : Ast.func_def) =
   let rec count_decls_in_stmt (stmt:Ast.stmt) =
     match stmt with
@@ -582,14 +566,13 @@ let calculate_frame_size (func_def : Ast.func_def) =
     | While (_, s) -> count_decls_in_stmt s
     | _ -> 0
   in
-  let num_locals =
-    List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
+  let num_locals = List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
   let num_params = List.length func_def.params in
-  let required_space = 8 + (num_params * 4) + (num_locals * 4) + 64 in
-  let aligned = (required_space + 15) / 16 * 16 in
-  max aligned 64
+  let required_space = 8 + (num_params * 4) + (num_locals * 4) + 64 in  (* 8字节用于ra和fp *)
+  let aligned = (required_space + 15) / 16 * 16 in  (* 16字节对齐 *)
+  max aligned 64  (* 最小栈帧大小 *)
 
-(* 生成函数代码 - 修复整体指令流顺序 *)
+(* 函数生成 - 修复参数处理和指令顺序 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   let ctx = create_context symbol_table func_def.fname in
   let frame_size = calculate_frame_size func_def in
@@ -612,7 +595,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
       Instruction (Sw (S11, -52, Fp)) ]
   in
   
-  (* 处理参数 *)
+  (* 处理参数 - 前8个从A0-A7加载，其余从栈加载 *)
   let param_instrs =
     List.mapi
       (fun i { Ast.pname = name; _ } ->
@@ -627,7 +610,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
            in
            [ Instruction (Sw (arg_reg, offset, Fp)) ]
          else
-           let stack_offset = (i - 8) * 4 + 16 in
+           let stack_offset = (i - 8) * 4 + 16 in  (* 跳过ra和fp *)
            [ Instruction (Lw (T0, stack_offset, Sp));
              Instruction (Sw (T0, offset, Fp)) ]
        in
@@ -643,7 +626,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
     |> List.flatten
   in
   
-  (* 检查函数体中是否已有return指令 *)
+  (* 检查是否有显式return *)
   let has_explicit_return =
     List.exists
       (function
@@ -652,14 +635,13 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
       body_items
   in
   
-  (* 隐式return的情况：先恢复S寄存器，再执行尾声 *)
+  (* 隐式return处理 *)
   let epilogue =
-    if has_explicit_return
-    then []
+    if has_explicit_return then []
     else List.map (fun i -> Instruction i) (gen_restore_s_regs @ gen_epilogue_instrs frame_size)
   in
   
-  (* 正确的指令顺序：序言 -> 保存S寄存器 -> 参数处理 -> 函数体 -> 隐式return处理 *)
+  (* 指令顺序：序言 -> 保存S寄存器 -> 参数处理 -> 函数体 -> 隐式return *)
   [ Label func_def.fname; Comment ("Function: " ^ func_def.fname) ]
   @ prologue 
   @ save_s_regs 
@@ -667,7 +649,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   @ body_items 
   @ epilogue
 
-(* 生成整个程序的代码 *)
+(* 程序生成 *)
 let gen_program symbol_table (program : Ast.program) =
   let header =
     [ Directive ".text"; 
@@ -681,6 +663,16 @@ let gen_program symbol_table (program : Ast.program) =
   in
   header @ func_asm_items
 
+(* 编译入口 *)
+let compile_to_riscv out_chan symbol_table program =
+  let asm_items = gen_program symbol_table program in
+  List.iter
+    (fun item ->
+       output_string out_chan (asm_item_to_string item);
+       output_string out_chan "\n")
+    asm_items
+
+
 (* 编译到RISC-V汇编 *)
 
 let compile_to_riscv symbol_table program =
@@ -688,4 +680,5 @@ let compile_to_riscv symbol_table program =
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
+
 
