@@ -103,6 +103,7 @@ type instruction =
   | Rem of reg * reg * reg (* rem rd, rs1, rs2 *)
   (* 逻辑指令 *)
   | And of reg * reg * reg (* and rd, rs1, rs2 *)
+  | Andi of reg * reg * int (* andi rd, rs1, imm *)  (* 新增：立即数与操作 *)
   | Or of reg * reg * reg (* or rd, rs1, rs2 *)
   | Xor of reg * reg * reg (* xor rd, rs1, rs2 *)
   | Xori of reg * reg * int (* xori rd, rs1, imm *)
@@ -171,6 +172,8 @@ let instr_to_string instr = match instr with
       (reg_to_string rd)
       (reg_to_string rs1)
       (reg_to_string rs2)
+  | Andi (rd, rs1, imm) ->  (* 新增：立即数与操作的字符串转换 *)
+    Printf.sprintf "andi %s, %s, 0x%x" (reg_to_string rd) (reg_to_string rs1) imm
   | Or (rd, rs1, rs2) ->
     Printf.sprintf "or %s, %s, %s"
       (reg_to_string rd)
@@ -513,14 +516,25 @@ let rec gen_stmt ctx frame_size (stmt : Ast.stmt) : asm_item list =
   | Ast.Return (Some e) ->
     (match e with
      | Ast.Literal(IntLit 0) ->
-       let all_instrs = [ Li (A0, 0) ] @ gen_epilogue_instrs frame_size in
+       let all_instrs = 
+         [ Li (A0, 0);
+           Andi (A0, A0, 0xFF)  (* 添加：A0 mod 256 *)
+         ] @ gen_epilogue_instrs frame_size in
        List.map (fun i -> Instruction i) all_instrs
      | _ ->
        let e_reg, e_instrs = gen_expr ctx e in
-       let all_instrs = e_instrs @ [ Mv (A0, e_reg) ] @ gen_epilogue_instrs frame_size in
+       let all_instrs = 
+         e_instrs @ 
+         [ Mv (A0, e_reg);
+           Andi (A0, A0, 0xFF)  (* 添加：A0 mod 256 *)
+         ] @ gen_epilogue_instrs frame_size in
        release_temp_reg ctx e_reg;
        List.map (fun i -> Instruction i) all_instrs)
-  | Ast.Return None -> List.map (fun i -> Instruction i) (gen_epilogue_instrs frame_size)
+  | Ast.Return None -> 
+    let all_instrs = 
+      [ Andi (A0, A0, 0xFF)  (* 添加：A0 mod 256 *)
+      ] @ gen_epilogue_instrs frame_size in
+    List.map (fun i -> Instruction i) all_instrs
   | Ast.If (cond, then_stmt, else_stmt) ->
     let cond_reg, cond_instrs = gen_expr ctx cond in
     let else_label = new_label ctx "else" in
@@ -680,7 +694,7 @@ let gen_program symbol_table (program : Ast.program) =
     [ Directive ".text"; 
       Directive ".globl main"; 
       Directive ".align 2";
-      Comment "ToyC Compiler Generated Code" ]
+      Comment "ToyC Compiler Generated Code with final result mod 256" ]
   in
   let func_asm_items =
     List.map
