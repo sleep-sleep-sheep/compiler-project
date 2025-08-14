@@ -394,38 +394,46 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let result_reg = A0 in
     let num_args = List.length args in
     let num_stack_args = max 0 (num_args - 8) in
+    (* 栈参数空间：每个参数4字节 *)
     let stack_args_space = num_stack_args * 4 in
-    let saved_regs_space = 7 * 4 in  (* T0-T6保存区 *)
+    (* 临时寄存器保存空间：T0-T6共7个寄存器 *)
+    let saved_regs_space = 7 * 4 in  (* 28字节 *)
     
-    (* 栈空间16字节对齐 *)
+    (* 栈布局（从低地址到高地址）：
+       1. 栈参数区（sp+16 开始）：stack_args_space 字节
+       2. 临时寄存器保存区：saved_regs_space 字节
+       总空间需要16字节对齐 *)
     let unaligned_space = stack_args_space + saved_regs_space in
     let stack_space = 
       if unaligned_space mod 16 = 0 then unaligned_space
       else (unaligned_space / 16 + 1) * 16
     in
     
-    (* 保存临时寄存器 *)
+    (* 保存临时寄存器（放在栈的高地址区域） *)
     let save_instrs = 
       if stack_space > 0 then
+        (* 分配栈空间（栈向下增长） *)
         Addi (Sp, Sp, -stack_space) ::
-        [ Sw (T0, saved_regs_space - 4, Sp);
-          Sw (T1, saved_regs_space - 8, Sp);
-          Sw (T2, saved_regs_space - 12, Sp);
-          Sw (T3, saved_regs_space - 16, Sp);
-          Sw (T4, saved_regs_space - 20, Sp);
-          Sw (T5, saved_regs_space - 24, Sp);
-          Sw (T6, saved_regs_space - 28, Sp)
+        (* 保存T0-T6到栈的高地址区域（紧接栈参数区之后） *)
+        [ Sw (T0, stack_args_space + 24, Sp);  (* T0在临时存区最高地址 *)
+          Sw (T1, stack_args_space + 20, Sp);
+          Sw (T2, stack_args_space + 16, Sp);
+          Sw (T3, stack_args_space + 12, Sp);
+          Sw (T4, stack_args_space + 8, Sp);
+          Sw (T5, stack_args_space + 4, Sp);
+          Sw (T6, stack_args_space, Sp)        (* T6在临时区最低地址 *)
         ]
       else []
     in
     
-    (* 处理参数 *)
+    (* 处理参数：前8个用寄存器，其余用栈 *)
     let arg_instrs =
       List.mapi
         (fun i arg ->
            let arg_reg, arg_code = gen_expr ctx arg in
            let instrs =
              if i < 8 then
+               (* 前8个参数使用a0-a7寄存器 *)
                let target_reg =
                  match i with
                  | 0 -> A0 | 1 -> A1 | 2 -> A2 | 3 -> A3
@@ -434,7 +442,8 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
                in
                arg_code @ [ Mv (target_reg, arg_reg) ]
              else
-               let stack_pos = saved_regs_space + (i - 8) * 4 in
+               (* 第9个及以后参数放在栈上，从sp+16开始（符合RISC-V调用约定） *)
+               let stack_pos = 16 + (i - 8) * 4 in
                arg_code @ [ Sw (arg_reg, stack_pos, Sp) ]
            in
            release_temp_reg ctx arg_reg;
@@ -447,13 +456,15 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let call_instr = [ Jal (Ra, fname) ] in
     let restore_instrs =
       if stack_space > 0 then
-        [ Lw (T0, saved_regs_space - 4, Sp);
-          Lw (T1, saved_regs_space - 8, Sp);
-          Lw (T2, saved_regs_space - 12, Sp);
-          Lw (T3, saved_regs_space - 16, Sp);
-          Lw (T4, saved_regs_space - 20, Sp);
-          Lw (T5, saved_regs_space - 24, Sp);
-          Lw (T6, saved_regs_space - 28, Sp);
+        (* 恢复T0-T6寄存器 *)
+        [ Lw (T0, stack_args_space + 24, Sp);
+          Lw (T1, stack_args_space + 20, Sp);
+          Lw (T2, stack_args_space + 16, Sp);
+          Lw (T3, stack_args_space + 12, Sp);
+          Lw (T4, stack_args_space + 8, Sp);
+          Lw (T5, stack_args_space + 4, Sp);
+          Lw (T6, stack_args_space, Sp);
+          (* 释放栈空间 *)
           Addi (Sp, Sp, stack_space)
         ]
       else []
@@ -464,9 +475,9 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
 (* 函数序言 - 分配栈帧并保存ra和fp *)
 let gen_prologue_instrs frame_size =
   [ Instruction(Addi (Sp, Sp, -frame_size));  (* 分配栈帧 *)
-    Instruction(Sw (Ra, frame_size - 4, Sp));  (* ra保存到fp-4 (sp+frame_size-4) *)
-    Instruction(Sw (Fp, frame_size - 8, Sp));  (* fp保存到fp-8 (sp+frame_size-8) *)
-    Instruction(Addi (Fp, Sp, frame_size))     (* fp = sp + frame_size (栈帧顶部) *)
+    Instruction(Sw (Ra, frame_size - 4, Sp));  (* ra保存到sp+frame_size-4 *)
+    Instruction(Sw (Fp, frame_size - 8, Sp));  (* fp保存到sp+frame_size-8 *)
+    Instruction(Addi (Fp, Sp, frame_size))     (* fp = sp + frame_size（指向调用前的sp） *)
   ]
 
 (* 函数尾声 - 恢复ra和fp并释放栈帧 *)
@@ -609,25 +620,25 @@ let calculate_frame_size (func_def : Ast.func_def) =
   let num_locals = List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
   let num_params = List.length func_def.params in
   
-  (* 各区域大小总和（字节） *)
-  let ra_fp_space = ra_size + fp_size in          (* 8字节：ra + fp *)
-  let s_regs_space = s_regs_save_area_size in     (* 48字节：s0-s11 *)
-  let params_space = max params_area_size (num_params * 4) in  (* 至少256字节 *)
-  let locals_space = if num_locals = 0 then 0 else (locals_start_offset - (locals_start_offset - num_locals * 4)) in
+  (* 各区域大小总和   - ra+fp: 8字节
+   - s0-s11: 48字节
+   - 参数区: 至少256字节
+   - 局部变量区: 按实际数量计算
+  *)
+  let ra_fp_space = ra_size + fp_size in          
+  let s_regs_space = s_regs_save_area_size in     
+  let params_space = max params_area_size (num_params * 4) in  
+  let locals_space = if num_locals = 0 then 0 else (num_locals * 4) in
   
-  (* 总需求空间 *)
+  (* 总需求空间 + 16字节对齐 *)
   let required_space = ra_fp_space + s_regs_space + params_space + locals_space in
-  
-  (* 16字节对齐 *)
   let aligned_space = 
     if required_space mod 16 = 0 then required_space
     else required_space + (16 - required_space mod 16)
   in
-  
-  (* 确保最小栈帧能容纳所有固定区域 *)
   max aligned_space (ra_fp_space + s_regs_space + params_space)
 
-(* 函数生成 - 按指定栈帧布局处理参数和局部变量 *)
+(* 函数生成 - 修复栈参数访问地址 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   let frame_size = calculate_frame_size func_def in
   let ctx = create_context symbol_table func_def.fname frame_size in
@@ -638,11 +649,10 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   (* 保存s0-s11寄存器到fp-12至fp-56 *)
   let save_s_regs = gen_save_s_regs in
   
-  (* 处理参数：分配到fp-60至fp-316的参数区 *)
+  (* 处理参数：关键修复！使用Fp访问栈参数 *)
   let param_instrs =
     List.mapi
       (fun i { Ast.pname = name; _ } ->
-       (* 为参数分配到参数区固定位置 *)
        let param_offset = add_param_var ctx name i in
        let instr =
          if i < 8 then
@@ -655,9 +665,10 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
            in
            [ Instruction (Sw (arg_reg, param_offset, Fp)) ]
          else
-           (* 第9个及以后参数从调用者栈帧加载（sp+16开始） *)
+           (* 关键修复：第9+个参数从Fp+16开始加载（而非Sp）
+              因为Fp = 调用前的Sp，与调用者存放参数的地址一致 *)
            let stack_arg_offset = 16 + ((i - 8) * 4) in
-           [ Instruction (Lw (T0, stack_arg_offset, Sp));  (* 从栈加载 *)
+           [ Instruction (Lw (T0, stack_arg_offset, Fp));  (* 使用Fp访问调用者栈参数 *)
              Instruction (Sw (T0, param_offset, Fp)) ]     (* 保存到参数区 *)
        in
        instr)
@@ -674,11 +685,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   
   (* 检查是否有显式return *)
   let has_explicit_return =
-    List.exists
-      (function
-        | Instruction Ret -> true
-        | _ -> false)
-      body_items
+    List.exists (function Instruction Ret -> true | _ -> false) body_items
   in
   
   (* 隐式return处理 *)
@@ -697,25 +704,20 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
 
 (* 程序生成 *)
 let gen_program symbol_table (program : Ast.program) =
-  let header =
-    [ Directive ".text"; 
-      Directive ".globl main"; 
-      Directive ".align 2";
-      Comment "Generated by RISC-V Code Generator (Strict Stack Layout)" ]
-  in
-  let func_asm_items =
-    List.map (gen_function symbol_table) program
-    |> List.flatten
-  in
-  header @ func_asm_items
+  [ Directive ".text"; 
+    Directive ".globl main"; 
+    Directive ".align 2";
+    Comment "Generated by RISC-V Code Generator (Fixed stack parameters)" ]
+  @ List.flatten (List.map (gen_function symbol_table) program)
 
 
-
+    
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
