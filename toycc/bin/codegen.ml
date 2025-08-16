@@ -73,15 +73,21 @@ let reg_to_string reg =
   | T5 -> "t5"
   | T6 -> "t6"
 
-(* 辅助函数：正确拆分立即数为高位和低位 *)
+(* 辅助函数：正确拆分立即数为高位和低位 
+   修复：使用算术右移(asr)替代逻辑右移(lsr)处理负数 *)
 let split_imm imm =
-  let imm32 = imm land 0xFFFFFFFF in
-  let lower = imm32 land 0xFFF in
+  let imm32 = imm land 0xFFFFFFFF in  (* 确保是32位值 *)
+  let lower = imm32 land 0xFFF in      (* 提取低12位 *)
+  (* 转换为有符号的12位值 *)
   let adjusted_lower =
-    if (lower land 0x800) != 0 then lower - 4096 else lower
+    if (lower land 0x800) != 0 then    (* 检查符号位 *)
+      lower - 4096                     (* 转换为负数 *)
+    else 
+      lower
   in
-  let upper = (imm32 - adjusted_lower) lsr 12 in
-  (upper land 0xFFFFF, adjusted_lower)
+  (* 计算高位，使用算术右移确保负数正确处理 *)
+  let upper = (imm32 - adjusted_lower) asr 12 in
+  (upper land 0xFFFFF, adjusted_lower)  (* 高位保持20位 *)
 
 (* RISC-V 指令类型 *)
 type instruction =
@@ -673,7 +679,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
          else
            (* 第9+个参数从调用者栈参数区加载 (sp+0开始) *)
            let stack_arg_offset = ((i - 8) * 4) in  (* sp+0开始的偏移 *)
-           [ Instruction (Lw (T0, stack_arg_offset, Fp));  (* 使用Sp访问调用者栈参数 *)(*_______________________________________________________________________________________________-*)
+           [ Instruction (Lw (T0, stack_arg_offset, Fp));
              Instruction (Sw (T0, param_offset, Fp)) ]     (* 保存到当前函数参数区 *)
        in
        instr)
@@ -727,13 +733,13 @@ let gen_program symbol_table (program : Ast.program) =
   @ List.flatten (List.map (gen_function symbol_table) program)
 
 
-
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
