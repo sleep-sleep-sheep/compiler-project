@@ -11,7 +11,7 @@ type reg =
   | T1 
   | T2 
   | Fp 
-  | S0  (* 新增S0寄存器 *)
+  | S0  (* s0寄存器 *)
   | S1 
   | A0 
   | A1 
@@ -48,7 +48,7 @@ let reg_to_string reg =
   | T1 -> "t1"
   | T2 -> "t2"
   | Fp -> "fp"
-  | S0 -> "s0"  (* S0寄存器映射 *)
+  | S0 -> "s0"
   | S1 -> "s1"
   | A0 -> "a0"
   | A1 -> "a1"
@@ -231,41 +231,66 @@ let emit_asm_to_file filepath asm_items =
 let emit_asm_to_stdout asm_items =
   List.iter (fun item -> print_endline (asm_item_to_string item)) asm_items
 
-(* 代码生成上下文 - 严格遵循栈帧布局 *)
+(* 代码生成上下文 - 增加函数调用结果保存区管理 *)
 type codegen_context =
   { mutable label_counter : int
   ; mutable temp_counter : int
   ; mutable temp_regs : reg list  (* 可用临时寄存器栈 *)
   ; mutable stack_offset : int    (* 当前栈偏移，从fp开始计算（负值） *)
+  ; mutable call_result_offset : int  (* 函数调用结果保存区当前偏移 *)
   ; mutable break_labels : string list
   ; mutable continue_labels : string list
   ; mutable local_vars : (string * int) list  (* 变量名到栈偏移的映射 *)
   ; func_name : string
   ; total_locals : int ref        (* 局部变量总数 *)
   ; frame_size : int              (* 当前函数的栈帧大小 *)
+  ; call_results_area_size : int  (* 函数调用结果保存区大小 *)
+  ; ret_val_offset : int          (* 函数返回值在栈帧中的偏移 (相对fp) *)
+  ; stack_args_offset : int       (* 栈参数区起始偏移 (相对sp) *)
   }
 
-(* 定义各区域大小常量（字节） *)
-let ra_size = 4                     (* ra寄存器大小 *)
-let fp_size = 4                     (* fp寄存器大小 *)
-let s_regs_count = 12               (* s0-s11共12个寄存器 *)
-let s_regs_save_area_size = s_regs_count * 4  (* 48字节 *)
-let max_params = 64                 (* 最大参数数量 *)
-let params_area_size = max_params * 4        (* 256字节 *)
-let locals_start_offset = -320      (* 局部变量区起始偏移 *)
+(* 定义需要保存的临时寄存器列表 - 现在由被调用者保存 *)
+let temp_regs_to_save = [T0; T1; T2; T3; T4; T5; T6]
+(* 计算需要的保存空间（每个寄存器4字节） *)
+let temp_regs_save_size = List.length temp_regs_to_save * 4
 
-(* 创建上下文 - 初始化局部变量偏移为fp-320 *)
-let create_context _symbol_table func_name frame_size =
+(* 定义各区域大小常量（字节） - 从高地址到低地址布局:
+   sp+0 ~ sp+255: 栈参数区 (固定256字节，用于传递参数到其他函数)
+   ...: 临时寄存器保存区 (28字节，用于保存T0-T6，现在由被调用者管理)
+   ...: 函数调用结果保存区
+   ...: 局部变量区
+   ...: 返回值保存区 (4字节)
+   ...: 参数区
+   ...: ra和fp保存区
+*)
+let ra_offset = -4                  (* ra寄存器位置: fp-4 *)
+let fp_offset = -8                  (* 旧fp寄存器位置: fp-8 *)
+let params_area_size = 256          (* 参数区固定256字节 *)
+let params_start_offset = -12       (* 参数区起始偏移: fp-12 *)
+let params_end_offset = params_start_offset - params_area_size  (* fp-268 *)
+let ret_val_area_size = 4           (* 返回值保存区4字节 *)
+let stack_args_area_size = 256      (* 栈参数区固定256字节，从sp+0开始 *)
+let call_results_area_size = 1024   (* 函数调用结果保存区1024字节 *)
+
+(* 创建上下文 - 初始化函数调用结果保存区 *)
+let create_context _symbol_table func_name frame_size call_results_area_size 
+    ret_val_offset stack_args_offset =
   { label_counter = 0;
     temp_counter = 0;
     temp_regs = [];
-    stack_offset = locals_start_offset;  (* 局部变量从fp-320开始 *)
+    (* 调整栈偏移，预留临时寄存器保存区（现在由被调用者管理） *)
+    stack_offset = params_end_offset - call_results_area_size - temp_regs_save_size;
+    (* 调整调用结果区偏移 *)
+    call_result_offset = params_end_offset - 4 - temp_regs_save_size;
     break_labels = [];
     continue_labels = [];
     local_vars = [];
     func_name = func_name;
     total_locals = ref 0;
-    frame_size = frame_size
+    frame_size = frame_size;
+    call_results_area_size = call_results_area_size;
+    ret_val_offset = ret_val_offset;   (* 返回值在栈帧中的偏移 *)
+    stack_args_offset = stack_args_offset
   }
 
 (* 生成新标签 *)
@@ -299,16 +324,26 @@ let release_temp_reg ctx reg =
   if not (List.mem reg ctx.temp_regs) then
     ctx.temp_regs <- reg :: ctx.temp_regs
 
-(* 变量栈管理 - 局部变量从fp-320向下分配 *)
-let add_local_var ctx name =
-  ctx.stack_offset <- ctx.stack_offset - 4;  (* 每次分配4字节 *)
-  ctx.local_vars <- (name, ctx.stack_offset) :: ctx.local_vars;
-  ctx.total_locals := !(ctx.total_locals) + 1;
-  ctx.stack_offset
+(* 为函数调用结果分配栈空间 *)
+let alloc_call_result ctx =
+  let offset = ctx.call_result_offset in
+  ctx.call_result_offset <- ctx.call_result_offset - 4;
+  if ctx.call_result_offset < (params_end_offset - ctx.call_results_area_size - temp_regs_save_size) then
+    failwith "Exceeded call results area size";
+  offset
 
-(* 添加参数变量 - 强制分配到参数区 *)
+(* 变量栈管理 - 局部变量从函数调用结果区下方开始分配 *)
+let add_local_var ctx name =
+  ctx.local_vars <- (name, ctx.stack_offset) :: ctx.local_vars;
+  ctx.stack_offset <- ctx.stack_offset - 4;  (* 每次分配4字节，向低地址增长 *)
+  ctx.total_locals := !(ctx.total_locals) + 1;
+  ctx.stack_offset + 4
+
+(* 添加参数变量 - 强制分配到参数区(fp-12开始) *)
 let add_param_var ctx name index =
-  let param_offset = -60 - (index * 4) in  (* 参数区从fp-60开始 *)
+  let param_offset = params_start_offset - (index * 4) in  (* 参数区从fp-12开始 *)
+  if param_offset < params_end_offset then  (* 确保不超出参数区范围 *)
+    failwith (Printf.sprintf "Too many parameters (max %d)" (params_area_size / 4));
   ctx.local_vars <- (name, param_offset) :: ctx.local_vars;
   param_offset
 
@@ -318,7 +353,23 @@ let get_var_offset ctx name =
   | None -> 
       failwith (Printf.sprintf "Variable '%s' not found in scope" name)
 
-(* 表达式生成逻辑 *)
+(* 生成保存临时寄存器的指令 - 现在在函数序言中调用 *)
+let save_temp_regs _ =
+  List.mapi (fun i reg ->
+    (* 计算保存位置，从参数区下方开始分配空间 *)
+    let offset = params_end_offset - (i * 4) - 4 in
+    Sw (reg, offset, Fp)
+  ) temp_regs_to_save
+
+(* 生成恢复临时寄存器的指令 - 现在在函数尾声中调用 *)
+let restore_temp_regs _ =
+  List.mapi (fun i reg ->
+    (* 使用与保存时相同的偏移位置 *)
+    let offset = params_end_offset - (i * 4) - 4 in
+    Lw (reg, offset, Fp)
+  ) temp_regs_to_save
+
+(* 表达式生成逻辑 - 修改为被调用者保存临时寄存器 *)
 let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
   match expr with
   | Ast.Literal(IntLit n) ->
@@ -391,42 +442,8 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     result_reg, instrs
 
   | Ast.Call (fname, args) ->
-    let result_reg = A0 in
-    let num_args = List.length args in
-    let num_stack_args = max 0 (num_args - 8) in
-    (* 栈参数空间：每个参数4字节 *)
-    let stack_args_space = num_stack_args * 4 in
-    (* 临时寄存器保存空间：T0-T6共7个寄存器 *)
-    let saved_regs_space = 7 * 4 in  (* 28字节 *)
-    
-    (* 栈布局（从低地址到高地址）：
-       1. 栈参数区（sp+16 开始）：stack_args_space 字节
-       2. 临时寄存器保存区：saved_regs_space 字节
-       总空间需要16字节对齐 *)
-    let unaligned_space = stack_args_space + saved_regs_space in
-    let stack_space = 
-      if unaligned_space mod 16 = 0 then unaligned_space
-      else (unaligned_space / 16 + 1) * 16
-    in
-    
-    (* 保存临时寄存器（放在栈的高地址区域） *)
-    let save_instrs = 
-      if stack_space > 0 then
-        (* 分配栈空间（栈向下增长） *)
-        Addi (Sp, Sp, -stack_space) ::
-        (* 保存T0-T6到栈的高地址区域（紧接栈参数区之后） *)
-        [ Sw (T0, stack_args_space + 24, Sp);  (* T0在临时存区最高地址 *)
-          Sw (T1, stack_args_space + 20, Sp);
-          Sw (T2, stack_args_space + 16, Sp);
-          Sw (T3, stack_args_space + 12, Sp);
-          Sw (T4, stack_args_space + 8, Sp);
-          Sw (T5, stack_args_space + 4, Sp);
-          Sw (T6, stack_args_space, Sp)        (* T6在临时区最低地址 *)
-        ]
-      else []
-    in
-    
-    (* 处理参数：前8个用寄存器，其余用栈 *)
+    (* 1. 处理参数：前8个用寄存器，其余用栈参数区(sp+0开始)
+       不再需要保存临时寄存器，因为现在由被调用者负责 *)
     let arg_instrs =
       List.mapi
         (fun i arg ->
@@ -442,114 +459,90 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
                in
                arg_code @ [ Mv (target_reg, arg_reg) ]
              else
-               (* 第9个及以后参数放在栈上，从sp+16开始（符合RISC-V调用约定） *)
-               let stack_pos = 16 + (i - 8) * 4 in
-               arg_code @ [ Sw (arg_reg, stack_pos, Sp) ]
+               (* 第9个及以后参数放在栈参数区(sp+0开始) *)
+               let stack_arg_offset = ctx.stack_args_offset + ((i - 8) * 4) in
+               arg_code @ [ Sw (arg_reg, stack_arg_offset, Sp) ]  (* 使用Sp作为基地址 *)
            in
            release_temp_reg ctx arg_reg;
            instrs)
         args
       |> List.flatten
     in
+  
+    (* 2. 调用者分配栈空间保存函数调用结果 *)
+    let result_offset = alloc_call_result ctx in
+    let result_reg = get_temp_reg ctx in
     
-    (* 函数调用和恢复现场 *)
-    let call_instr = [ Jal (Ra, fname) ] in
-    let restore_instrs =
-      if stack_space > 0 then
-        (* 恢复T0-T6寄存器 *)
-        [ Lw (T0, stack_args_space + 24, Sp);
-          Lw (T1, stack_args_space + 20, Sp);
-          Lw (T2, stack_args_space + 16, Sp);
-          Lw (T3, stack_args_space + 12, Sp);
-          Lw (T4, stack_args_space + 8, Sp);
-          Lw (T5, stack_args_space + 4, Sp);
-          Lw (T6, stack_args_space, Sp);
-          (* 释放栈空间 *)
-          Addi (Sp, Sp, stack_space)
-        ]
-      else []
-    in
+    (* 3. 函数调用并由调用者将返回值(A0)保存到栈上 *)
+    let call_instr = [ 
+      Jal (Ra, fname); 
+      Sw (A0, result_offset, Fp);  (* 调用者保存结果到栈 *)
+      Lw (result_reg, result_offset, Fp)  (* 从栈加载到结果寄存器 *)
+    ] in
     
-    result_reg, save_instrs @ arg_instrs @ call_instr @ restore_instrs   
+    (* 4. 返回结果寄存器和完整指令序列 - 不再需要恢复临时寄存器 *)
+    result_reg, arg_instrs @ call_instr   
 
-(* 函数序言 - 分配栈帧并保存ra和fp *)
-let gen_prologue_instrs frame_size =
-  [ Instruction(Addi (Sp, Sp, -frame_size));  (* 分配栈帧 *)
-    Instruction(Sw (Ra, frame_size - 4, Sp));  (* ra保存到sp+frame_size-4 *)
-    Instruction(Sw (Fp, frame_size - 8, Sp));  (* fp保存到sp+frame_size-8 *)
-    Instruction(Addi (Fp, Sp, frame_size))     (* fp = sp + frame_size（指向调用前的sp） *)
-  ]
+(* 函数序言 - 分配栈帧并保存ra、fp和临时寄存器(T0-T6) *)
+let gen_prologue_instrs ctx frame_size =
+  (* 首先分配整个栈帧 *)
+  let prologue = [ 
+    Addi (Sp, Sp, -frame_size);  (* 一次性分配整个栈帧 *)
+    Sw (Ra, frame_size-4, Sp);   (* ra保存到fp-4 *)
+    Sw (Fp, frame_size-8, Sp);   (* fp保存到fp-8 *)  
+    Addi (Fp, Sp, frame_size)    (* fp = sp + frame_size（指向调用前的sp） *)
+  ] in
+  
+  (* 被调用者保存临时寄存器T0-T6 *)
+  prologue @ save_temp_regs ctx
 
-(* 函数尾声 - 恢复ra和fp并释放栈帧 *)
-let gen_epilogue_instrs frame_size =
-  [ Lw (Ra, frame_size - 4, Sp);  (* 恢复ra *)
-    Lw (Fp, frame_size - 8, Sp);  (* 恢复fp *)
-    Addi (Sp, Sp, frame_size);    (* 释放栈帧 *)
-    Ret ]                         (* 返回 *)
+(* 函数尾声 - 恢复临时寄存器(T0-T6)、ra和fp并释放栈帧 *)
+let gen_epilogue_instrs ctx frame_size =
+  (* 被调用者恢复临时寄存器T0-T6，然后恢复ra和fp *)
+  restore_temp_regs ctx @ [
+    Lw (Ra, frame_size-4, Sp);   (* 恢复ra *)
+    Lw (Fp, frame_size-8, Sp);   (* 恢复fp *)
+    Addi (Sp, Sp, frame_size);   (* 释放整个栈帧 *)
+    Ret ]                        (* 返回 *)
 
-(* 保存s0-s11寄存器（fp-12到fp-56） *)
-let gen_save_s_regs =
-  [ Instruction (Sw (S0, -12, Fp));    (* s0: fp-12 *)
-    Instruction (Sw (S1, -16, Fp));    (* s1: fp-16 *)
-    Instruction (Sw (S2, -20, Fp));    (* s2: fp-20 *)
-    Instruction (Sw (S3, -24, Fp));    (* s3: fp-24 *)
-    Instruction (Sw (S4, -28, Fp));    (* s4: fp-28 *)
-    Instruction (Sw (S5, -32, Fp));    (* s5: fp-32 *)
-    Instruction (Sw (S6, -36, Fp));    (* s6: fp-36 *)
-    Instruction (Sw (S7, -40, Fp));    (* s7: fp-40 *)
-    Instruction (Sw (S8, -44, Fp));    (* s8: fp-44 *)
-    Instruction (Sw (S9, -48, Fp));    (* s9: fp-48 *)
-    Instruction (Sw (S10, -52, Fp));   (* s10: fp-52 *)
-    Instruction (Sw (S11, -56, Fp)) ]  (* s11: fp-56 *)
-
-(* 恢复s0-s11寄存器（逆序恢复） *)
-let gen_restore_s_regs =
-  [ Lw (S11, -56, Fp);   (* 恢复s11: fp-56 *)
-    Lw (S10, -52, Fp);   (* 恢复s10: fp-52 *)
-    Lw (S9, -48, Fp);    (* 恢复s9: fp-48 *)
-    Lw (S8, -44, Fp);    (* 恢复s8: fp-44 *)
-    Lw (S7, -40, Fp);    (* 恢复s7: fp-40 *)
-    Lw (S6, -36, Fp);    (* 恢复s6: fp-36 *)
-    Lw (S5, -32, Fp);    (* 恢复s5: fp-32 *)
-    Lw (S4, -28, Fp);    (* 恢复s4: fp-28 *)
-    Lw (S3, -24, Fp);    (* 恢复s3: fp-24 *)
-    Lw (S2, -20, Fp);    (* 恢复s2: fp-20 *)
-    Lw (S1, -16, Fp);    (* 恢复s1: fp-16 *)
-    Lw (S0, -12, Fp) ]   (* 恢复s0: fp-12 *)
-
-(* 语句生成逻辑 *)
+(* 语句生成逻辑 - 适应被调用者保存临时寄存器的策略 *)
 let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
   match stmt with
   | Ast.Empty -> []
   
   | Ast.ExprStmt e ->
     let reg, instrs = gen_expr ctx e in
+    (* 对于表达式语句，使用后释放寄存器但保留计算结果 *)
+    let items = List.map (fun i -> Instruction i) instrs in
     release_temp_reg ctx reg;
-    List.map (fun i -> Instruction i) instrs
+    items
   
   | Ast.Block stmts ->
     let old_vars = ctx.local_vars in
     let old_offset = ctx.stack_offset in
+    let old_call_offset = ctx.call_result_offset in
     let old_total_locals = !(ctx.total_locals) in
     let old_temp_regs = ctx.temp_regs in
     let items = List.map (gen_stmt ctx) stmts |> List.flatten in
     ctx.local_vars <- old_vars;
     ctx.stack_offset <- old_offset;
+    ctx.call_result_offset <- old_call_offset;
     ctx.total_locals := old_total_locals;
     ctx.temp_regs <- old_temp_regs;
     items
   
   | Ast.Return (Some e) ->
     let e_reg, e_instrs = gen_expr ctx e in
+    (* 函数返回值放入A0 *)
     let all_instrs = 
-      e_instrs @ [ Mv (A0, e_reg) ] @ gen_restore_s_regs @ gen_epilogue_instrs ctx.frame_size 
+      e_instrs @ [ Mv (A0, e_reg) ] @ gen_epilogue_instrs ctx ctx.frame_size 
     in
     release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
   
   | Ast.Return None -> 
     List.map (fun i -> Instruction i) 
-      ([ Li (A0, 0) ] @ gen_restore_s_regs @ gen_epilogue_instrs ctx.frame_size)
+      ([ Li (A0, 0) ] @ gen_epilogue_instrs ctx ctx.frame_size)
   
   | Ast.If (cond, then_stmt, else_stmt) ->
     let cond_reg, cond_instrs = gen_expr ctx cond in
@@ -594,6 +587,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
   | Ast.Decl (name, e) ->
     let offset = add_local_var ctx name in  (* 分配到局部变量区 *)
     let e_reg, e_instrs = gen_expr ctx e in
+    (* 将函数调用结果存储到变量中 *)
     let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in
     release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
@@ -601,12 +595,13 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
   | Ast.Assign (name, e) ->
     let offset = get_var_offset ctx name in
     let e_reg, e_instrs = gen_expr ctx e in
+    (* 将函数调用结果赋值给变量 *)
     let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in
     release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
 
-(* 栈帧大小计算 - 严格按照指定布局 *)
-let calculate_frame_size (func_def : Ast.func_def) =
+(* 栈帧大小计算 - 临时寄存器保存区仍需计算但由被调用者管理 *)
+let calculate_frame_size_and_offsets (func_def : Ast.func_def) =
   (* 统计局部变量数量 *)
   let rec count_decls_in_stmt (stmt:Ast.stmt) =
     match stmt with
@@ -618,45 +613,56 @@ let calculate_frame_size (func_def : Ast.func_def) =
     | _ -> 0
   in
   let num_locals = List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
-  let num_params = List.length func_def.params in
+  let locals_area_size = num_locals * 4 in
   
-  (* 各区域大小总和   - ra+fp: 8字节
-   - s0-s11: 48字节
-   - 参数区: 至少256字节
-   - 局部变量区: 按实际数量计算
+  (* 栈帧布局从高地址到低地址:
+     1. 栈参数区: sp+0 到 sp+255 (256字节) - 用于传递参数到其他函数
+     2. 临时寄存器保存区: 28字节 (T0-T6共7个寄存器，由被调用者管理)
+     3. 函数调用结果保存区: 1024字节
+     4. 局部变量区: locals_area_size 字节
+     5. 返回值保存区: 4字节
+     6. 参数区: 256字节
+     7. ra和fp保存区: 8字节
   *)
-  let ra_fp_space = ra_size + fp_size in          
-  let s_regs_space = s_regs_save_area_size in     
-  let params_space = max params_area_size (num_params * 4) in  
-  let locals_space = if num_locals = 0 then 0 else (num_locals * 4) in
   
-  (* 总需求空间 + 16字节对齐 *)
-  let required_space = ra_fp_space + s_regs_space + params_space + locals_space in
-  let aligned_space = 
-    if required_space mod 16 = 0 then required_space
-    else required_space + (16 - required_space mod 16)
+  (* 计算总栈帧大小，包含临时寄存器保存区 *)
+  let frame_size = 
+    stack_args_area_size +        (* 256字节 *)
+    temp_regs_save_size +         (* 临时寄存器保存区28字节 *)
+    call_results_area_size +      (* 1024字节 *)
+    locals_area_size +            (* 局部变量大小 *)
+    ret_val_area_size +           (* 返回值保存区4字节 *)
+    params_area_size +            (* 256字节 *)
+    8                             (* ra和fp (2个寄存器) *)
   in
-  max aligned_space (ra_fp_space + s_regs_space + params_space)
+  
+  (* 计算各区域偏移 (相对fp) *)
+  (* fp = sp + frame_size，所以sp = fp - frame_size *)
+  let stack_args_offset = 0 in  (* 栈参数区从sp+0开始 *)
+  
+  (* 返回值保存区相对fp的偏移 *)
+  let ret_val_offset = -(locals_area_size + params_area_size + 8) in
+  
+  (frame_size, call_results_area_size, ret_val_offset, stack_args_offset)
 
-(* 函数生成 - 修复栈参数访问地址 *)
+(* 函数生成 - 支持被调用者保存临时寄存器T0-T6 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
-  let frame_size = calculate_frame_size func_def in
-  let ctx = create_context symbol_table func_def.fname frame_size in
+  let (frame_size, call_results_area_size, ret_val_offset, stack_args_offset) = 
+    calculate_frame_size_and_offsets func_def in
+  let ctx = create_context symbol_table func_def.fname frame_size 
+      call_results_area_size ret_val_offset stack_args_offset in
   
-  (* 函数序言：分配栈帧并设置fp *)
-  let prologue = gen_prologue_instrs frame_size in
+  (* 函数序言：一次性分配整个栈帧、设置fp并保存临时寄存器 *)
+  let prologue = List.map (fun i -> Instruction i) (gen_prologue_instrs ctx frame_size) in
   
-  (* 保存s0-s11寄存器到fp-12至fp-56 *)
-  let save_s_regs = gen_save_s_regs in
-  
-  (* 处理参数：关键修复！使用Fp访问栈参数 *)
+  (* 处理参数：使用Fp访问栈参数 *)
   let param_instrs =
     List.mapi
       (fun i { Ast.pname = name; _ } ->
        let param_offset = add_param_var ctx name i in
        let instr =
          if i < 8 then
-           (* 前8个参数从A0-A7寄存器保存 *)
+           (* 前8个参数从A0-A7寄存器保存到参数区 *)
            let arg_reg =
              match i with
              | 0 -> A0 | 1 -> A1 | 2 -> A2 | 3 -> A3
@@ -665,11 +671,10 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
            in
            [ Instruction (Sw (arg_reg, param_offset, Fp)) ]
          else
-           (* 关键修复：第9+个参数从Fp+16开始加载（而非Sp）
-              因为Fp = 调用前的Sp，与调用者存放参数的地址一致 *)
-           let stack_arg_offset = 16 + ((i - 8) * 4) in
-           [ Instruction (Lw (T0, stack_arg_offset, Fp));  (* 使用Fp访问调用者栈参数 *)
-             Instruction (Sw (T0, param_offset, Fp)) ]     (* 保存到参数区 *)
+           (* 第9+个参数从调用者栈参数区加载 (sp+0开始) *)
+           let stack_arg_offset = ((i - 8) * 4) in  (* sp+0开始的偏移 *)
+           [ Instruction (Lw (T0, stack_arg_offset, Fp));  (* 使用Sp访问调用者栈参数 *)(*_______________________________________________________________________________________________-*)
+             Instruction (Sw (T0, param_offset, Fp)) ]     (* 保存到当前函数参数区 *)
        in
        instr)
       func_def.params
@@ -691,13 +696,15 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   (* 隐式return处理 *)
   let epilogue =
     if has_explicit_return then []
-    else List.map (fun i -> Instruction i) (gen_restore_s_regs @ gen_epilogue_instrs frame_size)
+    else List.map (fun i -> Instruction i) (gen_epilogue_instrs ctx frame_size)
   in
   
   (* 组合所有部分 *)
-  [ Label func_def.fname; Comment ("Function: " ^ func_def.fname) ]
+  [ Label func_def.fname; Comment ("Function: " ^ func_def.fname);
+    Comment ("Frame size: " ^ string_of_int frame_size ^ " bytes");
+    Comment ("Call results area size: " ^ string_of_int call_results_area_size ^ " bytes");
+    Comment ("Temp registers save area: " ^ string_of_int temp_regs_save_size ^ " bytes (被调用者管理)") ]
   @ prologue 
-  @ save_s_regs 
   @ param_instrs 
   @ body_items 
   @ epilogue
@@ -707,8 +714,18 @@ let gen_program symbol_table (program : Ast.program) =
   [ Directive ".text"; 
     Directive ".globl main"; 
     Directive ".align 2";
-    Comment "Generated by RISC-V Code Generator (Fixed stack parameters)" ]
+    Comment "Generated by RISC-V Code Generator (被调用者保存T0-T6寄存器)";
+    Comment "Stack layout from high to low address:";
+    Comment "1. 栈参数区: sp+0 ~ sp+255 (256字节，用于传递参数到其他函数)";
+    Comment "2. 临时寄存器保存区: 28字节 (保存T0-T6，由被调用者管理)";
+    Comment "3. 函数调用结果保存区: 1024字节";
+    Comment "4. 局部变量区";
+    Comment "5. 返回值保存区 (4字节)";
+    Comment "6. 参数区 (256字节)";
+    Comment "7. ra (fp-4) 和 旧fp (fp-8)";
+    Comment "函数进入时自动保存T0-T6，返回前恢复" ]
   @ List.flatten (List.map (gen_function symbol_table) program)
+
 
 
 let compile_to_riscv symbol_table program =
@@ -717,6 +734,7 @@ let compile_to_riscv symbol_table program =
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
