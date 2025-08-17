@@ -283,7 +283,7 @@ let params_end_offset = params_start_offset - params_area_size  (* fp-268 *)
 let ret_val_area_size = 4           (* 返回值保存区4字节 *)
 let stack_args_area_size = 256      (* 栈参数区固定256字节 *)
 let call_results_area_size = 32     (* 函数调用结果保存区 *)
-let spill_area_size = 32          (* 寄存器溢出区大小，可根据需要调整 *)
+let spill_area_size = 1024          (* 寄存器溢出区大小，可根据需要调整 *)
 
 (* 创建上下文 - 初始化寄存器溢出管理 *)
 let create_context _symbol_table func_name frame_size call_results_area_size 
@@ -357,7 +357,7 @@ let release_temp_reg ctx reg =
     ctx.free_regs := reg :: !(ctx.free_regs);
     
     (* 尝试从溢出栈恢复寄存器 *)
-    let try_restore () =
+    let  try_restore () =
       match !(ctx.spill_stack) with
       | spill :: spills ->
         (* 检查是否有空间恢复 *)
@@ -457,39 +457,62 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let e1_reg, e1_instrs = gen_expr ctx e1 in
     let e2_reg, e2_instrs = gen_expr ctx e2 in
     let result_reg, spill_instrs = get_temp_reg ctx in
-    let op_instrs =
+    let op_instrs, temp_regs_used =
       match op with
-      | "+" -> [ Add (result_reg, e1_reg, e2_reg) ]
-      | "-" -> [ Sub (result_reg, e1_reg, e2_reg) ]
-      | "*" -> [ Mul (result_reg, e1_reg, e2_reg) ]
-      | "/" -> [ Div (result_reg, e1_reg, e2_reg) ]
-      | "%" -> [ Rem (result_reg, e1_reg, e2_reg) ]
+      | "+" -> ([ Add (result_reg, e1_reg, e2_reg) ], [])
+      | "-" -> ([ Sub (result_reg, e1_reg, e2_reg) ], [])
+      | "*" -> ([ Mul (result_reg, e1_reg, e2_reg) ], [])
+      | "/" -> ([ Div (result_reg, e1_reg, e2_reg) ], [])
+      | "%" -> ([ Rem (result_reg, e1_reg, e2_reg) ], [])
       | "==" ->  
-          [ Sub (result_reg, e1_reg, e2_reg); 
-            Sltiu (result_reg, result_reg, 1) ]
+          ([ Sub (result_reg, e1_reg, e2_reg); 
+             Sltiu (result_reg, result_reg, 1) ], [])
       | "!=" -> 
-          [ Sub (result_reg, e1_reg, e2_reg); 
-            Sltu (result_reg, Zero, result_reg) ]
-      | "<" -> [ Slt (result_reg, e1_reg, e2_reg) ]
+          ([ Sub (result_reg, e1_reg, e2_reg); 
+             Sltu (result_reg, Zero, result_reg) ], [])
+      | "<" -> ([ Slt (result_reg, e1_reg, e2_reg) ], [])
       | "<=" -> 
-          [ Slt (T0, e2_reg, e1_reg); 
-            Xori (result_reg, T0, 1) ]
-      | ">" -> [ Slt (result_reg, e2_reg, e1_reg) ]
+          let t0, t0_spill = get_temp_reg ctx in
+          let instrs = t0_spill @ [
+            Slt (t0, e2_reg, e1_reg); 
+            Xori (result_reg, t0, 1)
+          ] in
+          (instrs, [t0])
+      | ">" -> ([ Slt (result_reg, e2_reg, e1_reg) ], [])
       | ">=" -> 
-          [ Slt (T0, e1_reg, e2_reg); 
-            Xori (result_reg, T0, 1) ]
+          let t0, t0_spill = get_temp_reg ctx in
+          let instrs = t0_spill @ [
+            Slt (t0, e1_reg, e2_reg); 
+            Xori (result_reg, t0, 1)
+          ] in
+          (instrs, [t0])
       | "&&" ->
-          [ Sltu (T0, Zero, e1_reg);
-            Sltu (T1, Zero, e2_reg);
-            And (result_reg, T0, T1) ]
+          let t0, t0_spill = get_temp_reg ctx in
+          let t1, t1_spill = get_temp_reg ctx in
+          let instrs = t0_spill @ t1_spill @ [
+            Sltu (t0, Zero, e1_reg);
+            Sltu (t1, Zero, e2_reg);
+            And (result_reg, t0, t1)
+          ] in
+          (instrs, [t0; t1])
       | "||" ->
-          [ Or (T0, e1_reg, e2_reg);
-            Sltu (result_reg, Zero, T0) ]
+          let t0, t0_spill = get_temp_reg ctx in
+          let instrs = t0_spill @ [
+            Or (t0, e1_reg, e2_reg);
+            Sltu (result_reg, Zero, t0)
+          ] in
+          (instrs, [t0])
       | _ -> failwith (Printf.sprintf "Unknown binary operator: %s" op)
     in
+    (* 释放临时寄存器 *)
+    let release_temp_instrs = 
+      List.concat_map (fun reg -> release_temp_reg ctx reg) temp_regs_used in
+    (* 释放操作数寄存器 *)
     let release_e1_instrs = release_temp_reg ctx e1_reg in
     let release_e2_instrs = release_temp_reg ctx e2_reg in
-    let instrs = e1_instrs @ e2_instrs @ spill_instrs @ op_instrs @ release_e1_instrs @ release_e2_instrs in
+    (* 组合所有指令 *)
+    let instrs = e1_instrs @ e2_instrs @ spill_instrs @ op_instrs 
+                 @ release_temp_instrs @ release_e1_instrs @ release_e2_instrs in
     result_reg, instrs
 
   | Ast.Call (fname, args) ->
@@ -804,6 +827,7 @@ let compile_to_riscv symbol_table program =
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
