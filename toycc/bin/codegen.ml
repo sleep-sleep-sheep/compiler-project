@@ -282,8 +282,8 @@ let params_start_offset = -12       (* 参数区起始偏移: fp-12 *)
 let params_end_offset = params_start_offset - params_area_size  (* fp-268 *)
 let ret_val_area_size = 4           (* 返回值保存区4字节 *)
 let stack_args_area_size = 256      (* 栈参数区固定256字节 *)
-let call_results_area_size = 32     (* 函数调用结果保存区 *)
-let spill_area_size = 1024          (* 寄存器溢出区大小，可根据需要调整 *)
+let call_results_area_size = 512     (* 函数调用结果保存区 *)
+let spill_area_size = 64          (* 寄存器溢出区大小，可根据需要调整 *)
 
 (* 创建上下文 - 初始化寄存器溢出管理 *)
 let create_context _symbol_table func_name frame_size call_results_area_size 
@@ -820,13 +820,13 @@ let gen_program symbol_table (program : Ast.program) =
 
 
 
-
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
