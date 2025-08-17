@@ -73,21 +73,15 @@ let reg_to_string reg =
   | T5 -> "t5"
   | T6 -> "t6"
 
-(* 辅助函数：正确拆分立即数为高位和低位 
-   修复：使用算术右移(asr)替代逻辑右移(lsr)处理负数 *)
+(* 辅助函数：正确拆分立即数为高位和低位 *)
 let split_imm imm =
-  let imm32 = imm land 0xFFFFFFFF in  (* 确保是32位值 *)
-  let lower = imm32 land 0xFFF in      (* 提取低12位 *)
-  (* 转换为有符号的12位值 *)
+  let imm32 = imm land 0xFFFFFFFF in
+  let lower = imm32 land 0xFFF in
   let adjusted_lower =
-    if (lower land 0x800) != 0 then    (* 检查符号位 *)
-      lower - 4096                     (* 转换为负数 *)
-    else 
-      lower
+    if (lower land 0x800) != 0 then lower - 4096 else lower
   in
-  (* 计算高位，使用算术右移确保负数正确处理 *)
-  let upper = (imm32 - adjusted_lower) asr 12 in
-  (upper land 0xFFFFF, adjusted_lower)  (* 高位保持20位 *)
+  let upper = (imm32 - adjusted_lower) lsr 12 in
+  (upper land 0xFFFFF, adjusted_lower)
 
 (* RISC-V 指令类型 *)
 type instruction =
@@ -276,7 +270,7 @@ let params_start_offset = -12       (* 参数区起始偏移: fp-12 *)
 let params_end_offset = params_start_offset - params_area_size  (* fp-268 *)
 let ret_val_area_size = 4           (* 返回值保存区4字节 *)
 let stack_args_area_size = 256      (* 栈参数区固定256字节，从sp+0开始 *)
-let call_results_area_size = 1024   (* 函数调用结果保存区1024字节 *)
+let call_results_area_size = 48   (* 函数调用结果保存区1024字节 *)
 
 (* 创建上下文 - 初始化函数调用结果保存区 *)
 let create_context _symbol_table func_name frame_size call_results_area_size 
@@ -679,7 +673,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
          else
            (* 第9+个参数从调用者栈参数区加载 (sp+0开始) *)
            let stack_arg_offset = ((i - 8) * 4) in  (* sp+0开始的偏移 *)
-           [ Instruction (Lw (T0, stack_arg_offset, Fp));
+           [ Instruction (Lw (T0, stack_arg_offset, Fp));  (* 使用Sp访问调用者栈参数 *)(*_______________________________________________________________________________________________-*)
              Instruction (Sw (T0, param_offset, Fp)) ]     (* 保存到当前函数参数区 *)
        in
        instr)
@@ -733,12 +727,15 @@ let gen_program symbol_table (program : Ast.program) =
   @ List.flatten (List.map (gen_function symbol_table) program)
 
 
+
+
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
