@@ -1,6 +1,6 @@
 open Ast
 
-(* RISC-V 32位寄存器定义 - 包含s0-s11完整12个寄存器 *)
+(* RISC-V 32位寄存器定义 *)
 type reg =
   | Zero 
   | Ra 
@@ -11,7 +11,7 @@ type reg =
   | T1 
   | T2 
   | Fp 
-  | S0  (* s0寄存器 *)
+  | S0  
   | S1 
   | A0 
   | A1 
@@ -73,7 +73,7 @@ let reg_to_string reg =
   | T5 -> "t5"
   | T6 -> "t6"
 
-(* 辅助函数：正确拆分立即数为高位和低位 *)
+(* 辅助函数：拆分立即数为高位和低位 *)
 let split_imm imm =
   let imm32 = imm land 0xFFFFFFFF in
   let lower = imm32 land 0xFFF in
@@ -231,21 +231,11 @@ let emit_asm_to_file filepath asm_items =
 let emit_asm_to_stdout asm_items =
   List.iter (fun item -> print_endline (asm_item_to_string item)) asm_items
 
-(* 寄存器状态跟踪：用于管理临时寄存器的使用和溢出 *)
-type reg_status = {
-  in_use: bool;          (* 寄存器是否正在使用 *)
-  spill_offset: int option;  (* 若已溢出，保存其在栈上的偏移 *)
-  last_used: int;        (* 最后使用时间戳，用于LRU替换 *)
-}
-
 (* 代码生成上下文 - 增加寄存器溢出管理 *)
 type codegen_context =
   { mutable label_counter : int
   ; mutable temp_counter : int
-  ; mutable timestamp : int  (* 用于跟踪寄存器使用时间 *)
-  ; temp_regs : reg list  (* 所有可用临时寄存器列表 *)
-  ; mutable reg_statuses : (reg * reg_status) list  (* 寄存器状态表 *)
-  ; mutable spill_stack_offset : int  (* 临时溢出栈当前偏移（相对fp） *)
+  ; mutable temp_regs : reg list  (* 可用临时寄存器栈 *)
   ; mutable stack_offset : int    (* 当前栈偏移，从fp开始计算（负值） *)
   ; mutable call_result_offset : int  (* 函数调用结果保存区当前偏移 *)
   ; mutable break_labels : string list
@@ -257,46 +247,35 @@ type codegen_context =
   ; call_results_area_size : int  (* 函数调用结果保存区大小 *)
   ; ret_val_offset : int          (* 函数返回值在栈帧中的偏移 (相对fp) *)
   ; stack_args_offset : int       (* 栈参数区起始偏移 (相对sp) *)
-  ; spill_area_size : int         (* 临时溢出区总大小 *)
+  (* 寄存器溢出相关 *)
+  ; mutable spill_offset : int    (* 溢出区当前偏移（相对fp） *)
+  ; mutable spill_map : (reg * int) list  (* 记录被溢出的寄存器及其偏移 *)
+  ; spill_area_size : int         (* 溢出区总大小 *)
   }
 
-(* 定义所有临时寄存器（T0-T6） *)
-let all_temp_regs = [T0; T1; T2; T3; T4; T5; T6]
-let num_temp_regs = List.length all_temp_regs
-
-(* 定义需要保存的临时寄存器列表（被调用者保存） *)
-let temp_regs_to_save = all_temp_regs
-(* 计算需要的保存空间（每个寄存器4字节） *)
+(* 定义需要保存的临时寄存器列表 - 被调用者保存 *)
+let temp_regs_to_save = [T0; T1; T2; T3; T4; T5; T6]
 let temp_regs_save_size = List.length temp_regs_to_save * 4
 
-(* 定义各区域大小常量（字节） - 新增临时溢出区 *)
+(* 栈布局常量（字节） *)
 let ra_offset = -4                  (* ra寄存器位置: fp-4 *)
 let fp_offset = -8                  (* 旧fp寄存器位置: fp-8 *)
 let params_area_size = 256          (* 参数区固定256字节 *)
 let params_start_offset = -12       (* 参数区起始偏移: fp-12 *)
 let params_end_offset = params_start_offset - params_area_size  (* fp-268 *)
 let ret_val_area_size = 4           (* 返回值保存区4字节 *)
-let stack_args_area_size = 256      (* 栈参数区固定256字节，从sp+0开始 *)
-let call_results_area_size = 256     (* 函数调用结果保存区32字节 *)
-let spill_area_size = 48         (* 临时寄存器溢出区1024字节 *)
+let stack_args_area_size = 256      (* 栈参数区固定256字节 *)
+let call_results_area_size = 32     (* 函数调用结果保存区 *)
+let spill_area_size = 128           (* 寄存器溢出区大小（32个寄存器） *)
 
-(* 初始化寄存器状态表 *)
-let init_reg_statuses () =
-  List.map (fun reg ->
-    (reg, { in_use = false; spill_offset = None; last_used = 0 })
-  ) all_temp_regs
-
-(* 创建上下文 - 初始化寄存器溢出管理 *)
+(* 创建上下文 - 初始化寄存器溢出区 *)
 let create_context _symbol_table func_name frame_size call_results_area_size 
     ret_val_offset stack_args_offset spill_area_size =
   { label_counter = 0;
     temp_counter = 0;
-    timestamp = 0;
-    temp_regs = all_temp_regs;
-    reg_statuses = init_reg_statuses ();
-    spill_stack_offset = params_end_offset - spill_area_size;  (* 溢出区从参数区下方开始 *)
+    temp_regs = [];
     stack_offset = params_end_offset - call_results_area_size - temp_regs_save_size - spill_area_size;
-    call_result_offset = params_end_offset - 4 - temp_regs_save_size - spill_area_size;
+    call_result_offset = params_end_offset - 4 - temp_regs_save_size;
     break_labels = [];
     continue_labels = [];
     local_vars = [];
@@ -306,7 +285,10 @@ let create_context _symbol_table func_name frame_size call_results_area_size
     call_results_area_size = call_results_area_size;
     ret_val_offset = ret_val_offset;
     stack_args_offset = stack_args_offset;
-    spill_area_size = spill_area_size;
+    (* 溢出区初始化 - 位于局部变量区下方 *)
+    spill_offset = params_end_offset - call_results_area_size - temp_regs_save_size - 4;
+    spill_map = [];
+    spill_area_size = spill_area_size
   }
 
 (* 生成新标签 *)
@@ -315,107 +297,85 @@ let new_label ctx prefix =
   ctx.label_counter <- ctx.label_counter + 1;
   label
 
-(* 更新寄存器使用时间戳 *)
-let update_reg_timestamp ctx reg =
-  ctx.timestamp <- ctx.timestamp + 1;
-  ctx.reg_statuses <- List.map (fun (r, s) ->
-    if r = reg then (r, { s with last_used = ctx.timestamp })
-    else (r, s)
-  ) ctx.reg_statuses
+(* 临时寄存器管理 - 新增溢出机制 *)
+let get_temp_reg ctx =
+  match ctx.temp_regs with
+  | reg :: rest ->
+      ctx.temp_regs <- rest;
+      (* 检查是否需要从溢出区恢复该寄存器 *)
+      let rec find_spilled reg = function
+        | (r, off) :: _ when r = reg -> Some off
+        | _ :: tl -> find_spilled reg tl
+        | [] -> None
+      in
+      let instrs =
+        match find_spilled reg ctx.spill_map with
+        | Some off ->
+            (* 从溢出区恢复寄存器值 *)
+            ctx.spill_map <- List.filter (fun (r, _) -> r <> reg) ctx.spill_map;
+            [ Lw (reg, off, Fp) ]
+        | None -> []
+      in
+      (reg, instrs)
+  | [] ->
+      (* 临时寄存器耗尽，需要溢出一个寄存器 *)
+      (* 选择溢出策略：循环使用t0-t6 *)
+      let reg_to_spill = 
+        match ctx.temp_counter mod 7 with
+        | 0 -> T0 | 1 -> T1 | 2 -> T2 | 3 -> T3 | 4 -> T4 | 5 -> T5 | 6 -> T6
+        | _ -> failwith "Invalid temp reg index"
+      in
+      ctx.temp_counter <- ctx.temp_counter + 1;
+      
+      (* 检查该寄存器是否已在溢出区 *)
+      let existing_offset =
+        List.find_map (fun (r, off) -> if r = reg_to_spill then Some off else None) ctx.spill_map
+      in
+      
+      (* 生成溢出指令并更新溢出区信息 *)
+      let (spill_instrs, new_offset) =
+        match existing_offset with
+        | Some off ->
+            (* 已在溢出区，直接覆盖 *)
+            ([ Sw (reg_to_spill, off, Fp) ], off)
+        | None ->
+            (* 分配新的溢出位置 *)
+            let off = ctx.spill_offset in
+            ctx.spill_offset <- ctx.spill_offset - 4;
+            (* 检查溢出区是否耗尽 *)
+            if ctx.spill_offset < (ctx.spill_offset - ctx.spill_area_size) then
+              failwith "Register spill area exhausted";
+            ([ Sw (reg_to_spill, off, Fp) ], off)
+      in
+      
+      (* 更新溢出映射表 *)
+      ctx.spill_map <- (reg_to_spill, new_offset) :: 
+                      List.filter (fun (r, _) -> r <> reg_to_spill) ctx.spill_map;
+      
+      (reg_to_spill, spill_instrs)
 
-(* 查找可用的临时寄存器（未被使用的） *)
-let find_free_reg ctx =
-  List.find_opt (fun (_, s) -> not s.in_use) ctx.reg_statuses
-  |> Option.map fst
-
-(* 查找最久未使用的寄存器（用于溢出） *)
-let find_lru_reg ctx =
-  ctx.reg_statuses
-  |> List.filter (fun (_, s) -> s.in_use)
-  |> List.fold_left (fun acc (r, s) ->
-       match acc with
-       | None -> Some (r, s)
-       | Some (_, s') -> if s.last_used < s'.last_used then Some (r, s) else acc
-     ) None
-  |> Option.map fst
-
-(* 分配溢出空间并保存寄存器值 *)
-let spill_reg ctx reg : instruction list =
-  if ctx.spill_stack_offset < (params_end_offset - ctx.spill_area_size) then
-    failwith "临时溢出区空间不足";
-  
-  (* 记录溢出位置 *)
-  let offset = ctx.spill_stack_offset in
-  ctx.spill_stack_offset <- ctx.spill_stack_offset - 4;
-  
-  (* 更新寄存器状态 *)
-  ctx.reg_statuses <- List.map (fun (r, s) ->
-    if r = reg then (r, { s with spill_offset = Some offset })
-    else (r, s)
-  ) ctx.reg_statuses;
-  
-  (* 生成保存指令 *)
-  [Sw (reg, offset, Fp)]
-
-(* 从溢出区恢复寄存器值 *)
-let restore_reg ctx reg : instruction list =
-  let status = List.assoc reg ctx.reg_statuses in
-  match status.spill_offset with
-  | None -> []  (* 未溢出，无需恢复 *)
-  | Some offset ->
-      (* 生成恢复指令 *)
-      [Lw (reg, offset, Fp)]
-
-(* 获取临时寄存器 - 实现溢出机制 *)
-let get_temp_reg ctx : reg * instruction list =
-  (* 1. 先尝试查找未使用的寄存器 *)
-  match find_free_reg ctx with
-  | Some reg ->
-      (* 标记为使用中 *)
-      ctx.reg_statuses <- List.map (fun (r, s) ->
-        if r = reg then (r, { s with in_use = true; last_used = ctx.timestamp })
-        else (r, s)
-      ) ctx.reg_statuses;
-      update_reg_timestamp ctx reg;
-      (reg, [])
-  
-  (* 2. 无可用寄存器，需要溢出最久未使用的 *)
-  | None ->
-      match find_lru_reg ctx with
-      | None -> failwith "没有可用的临时寄存器"
-      | Some lru_reg ->
-          (* 保存LRU寄存器的值到溢出区 *)
-          let spill_instrs = spill_reg ctx lru_reg in
-          (* 标记为可复用（仍为使用中，但已溢出） *)
-          update_reg_timestamp ctx lru_reg;
-          (lru_reg, spill_instrs)
-
-(* 释放临时寄存器 - 使其可被再次使用 *)
 let release_temp_reg ctx reg =
-  ctx.reg_statuses <- List.map (fun (r, s) ->
-    if r = reg then (r, { s with in_use = false })
-    else (r, s)
-  ) ctx.reg_statuses
+  if not (List.mem reg ctx.temp_regs) then
+    ctx.temp_regs <- reg :: ctx.temp_regs
 
 (* 为函数调用结果分配栈空间 *)
 let alloc_call_result ctx =
   let offset = ctx.call_result_offset in
   ctx.call_result_offset <- ctx.call_result_offset - 4;
-  if ctx.call_result_offset < (params_end_offset - ctx.call_results_area_size - temp_regs_save_size - ctx.spill_area_size) then
+  if ctx.call_result_offset < (params_end_offset - ctx.call_results_area_size - temp_regs_save_size) then
     failwith "Exceeded call results area size";
   offset
 
-(* 变量栈管理 - 局部变量从函数调用结果区下方开始分配 *)
+(* 变量栈管理 *)
 let add_local_var ctx name =
   ctx.local_vars <- (name, ctx.stack_offset) :: ctx.local_vars;
-  ctx.stack_offset <- ctx.stack_offset - 4;  (* 每次分配4字节，向低地址增长 *)
+  ctx.stack_offset <- ctx.stack_offset - 4;
   ctx.total_locals := !(ctx.total_locals) + 1;
   ctx.stack_offset + 4
 
-(* 添加参数变量 - 强制分配到参数区(fp-12开始) *)
 let add_param_var ctx name index =
-  let param_offset = params_start_offset - (index * 4) in  (* 参数区从fp-12开始 *)
-  if param_offset < params_end_offset then  (* 确保不超出参数区范围 *)
+  let param_offset = params_start_offset - (index * 4) in
+  if param_offset < params_end_offset then
     failwith (Printf.sprintf "Too many parameters (max %d)" (params_area_size / 4));
   ctx.local_vars <- (name, param_offset) :: ctx.local_vars;
   param_offset
@@ -426,44 +386,42 @@ let get_var_offset ctx name =
   | None -> 
       failwith (Printf.sprintf "Variable '%s' not found in scope" name)
 
-(* 生成保存临时寄存器的指令 - 被调用者保存 *)
+(* 保存和恢复临时寄存器 *)
 let save_temp_regs _ =
   List.mapi (fun i reg ->
-    (* 计算保存位置，从参数区下方开始分配空间 *)
-    let offset = params_end_offset - (i * 4) - 4 - spill_area_size in
+    let offset = params_end_offset - (i * 4) - 4 in
     Sw (reg, offset, Fp)
   ) temp_regs_to_save
 
-(* 生成恢复临时寄存器的指令 - 被调用者恢复 *)
 let restore_temp_regs _ =
   List.mapi (fun i reg ->
-    let offset = params_end_offset - (i * 4) - 4 - spill_area_size in
+    let offset = params_end_offset - (i * 4) - 4 in
     Lw (reg, offset, Fp)
   ) temp_regs_to_save
 
-(* 表达式生成逻辑 - 带寄存器溢出机制 *)
+(* 表达式生成逻辑 - 支持寄存器溢出 *)
 let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
   match expr with
   | Ast.Literal(IntLit n) ->
-    let reg, spill_instrs = get_temp_reg ctx in
-    let instrs =
+    let (reg, spill_instrs) = get_temp_reg ctx in
+    let load_instrs =
       if n >= -2048 && n <= 2047 then [ Li (reg, n) ]
       else
         let (upper, lower) = split_imm n in
         [ Lui (reg, upper); Addi (reg, reg, lower) ]
     in
-    (reg, spill_instrs @ instrs)
+    (reg, spill_instrs @ load_instrs)
 
   | Ast.Var id ->
-    let reg, spill_instrs = get_temp_reg ctx in
+    let (reg, spill_instrs) = get_temp_reg ctx in
     let offset = get_var_offset ctx id in
-    (reg, spill_instrs @ [ Lw (reg, offset, Fp) ])  (* 从fp偏移加载变量 *)
+    (reg, spill_instrs @ [ Lw (reg, offset, Fp) ])
 
   | Ast.Paren e -> gen_expr ctx e
 
   | Ast.UnOp (op, e) ->
-    let e_reg, e_instrs = gen_expr ctx e in
-    let result_reg, spill_instrs = get_temp_reg ctx in
+    let (e_reg, e_instrs) = gen_expr ctx e in
+    let (result_reg, spill_instrs) = get_temp_reg ctx in
     let op_instrs =
       match op with
       | "+" -> [ Mv (result_reg, e_reg) ]
@@ -476,14 +434,13 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     (result_reg, instrs)
 
   | Ast.BinOp (e1, op, e2) ->
-    (* 生成左表达式 *)
-    let e1_reg, e1_instrs = gen_expr ctx e1 in
-    (* 生成右表达式（可能需要溢出） *)
-    let e2_reg, e2_instrs = gen_expr ctx e2 in
-    (* 获取结果寄存器（可能需要溢出） *)
-    let result_reg, spill_instrs = get_temp_reg ctx in
+    (* 生成左表达式，可能包含溢出指令 *)
+    let (e1_reg, e1_instrs) = gen_expr ctx e1 in
+    (* 生成右表达式，可能包含溢出指令 *)
+    let (e2_reg, e2_instrs) = gen_expr ctx e2 in
+    (* 获取结果寄存器，可能包含溢出指令 *)
+    let (result_reg, spill_instrs) = get_temp_reg ctx in
     
-    (* 生成运算指令 *)
     let op_instrs =
       match op with
       | "+" -> [ Add (result_reg, e1_reg, e2_reg) ]
@@ -515,21 +472,18 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       | _ -> failwith (Printf.sprintf "Unknown binary operator: %s" op)
     in
     
-    (* 组合指令并释放寄存器 *)
     let instrs = e1_instrs @ e2_instrs @ spill_instrs @ op_instrs in
     release_temp_reg ctx e1_reg;
     release_temp_reg ctx e2_reg;
     (result_reg, instrs)
 
   | Ast.Call (fname, args) ->
-    (* 1. 处理参数：前8个用寄存器，其余用栈参数区(sp+0开始) *)
     let arg_instrs =
       List.mapi
         (fun i arg ->
-           let arg_reg, arg_code = gen_expr ctx arg in
+           let (arg_reg, arg_code) = gen_expr ctx arg in
            let instrs =
              if i < 8 then
-               (* 前8个参数使用a0-a7寄存器 *)
                let target_reg =
                  match i with
                  | 0 -> A0 | 1 -> A1 | 2 -> A2 | 3 -> A3
@@ -538,7 +492,6 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
                in
                arg_code @ [ Mv (target_reg, arg_reg) ]
              else
-               (* 第9个及以后参数放在栈参数区(sp+0开始) *)
                let stack_arg_offset = ctx.stack_args_offset + ((i - 8) * 4) in
                arg_code @ [ Sw (arg_reg, stack_arg_offset, Sp) ]
            in
@@ -548,40 +501,30 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       |> List.flatten
     in
   
-    (* 2. 调用者分配栈空间保存函数调用结果 *)
     let result_offset = alloc_call_result ctx in
-    let result_reg, spill_instrs = get_temp_reg ctx in
+    let (result_reg, spill_instrs) = get_temp_reg ctx in
     
-    (* 3. 函数调用并保存返回值 *)
     let call_instr = [ 
       Jal (Ra, fname); 
-      Sw (A0, result_offset, Fp);  (* 保存结果到栈 *)
-      Lw (result_reg, result_offset, Fp)  (* 加载到结果寄存器 *)
+      Sw (A0, result_offset, Fp);
+      Lw (result_reg, result_offset, Fp)
     ] in
     
-    (* 4. 返回结果寄存器和指令序列 *)
-    (result_reg, arg_instrs @ spill_instrs @ call_instr)   
+    (result_reg, arg_instrs @ spill_instrs @ call_instr)
 
-(* 函数序言 - 分配栈帧并保存ra、fp和临时寄存器(T0-T6) *)
+(* 函数序言和尾声 *)
 let gen_prologue_instrs ctx frame_size =
-  (* 首先分配整个栈帧 *)
-  let prologue = [ 
-    Addi (Sp, Sp, -frame_size);  (* 一次性分配整个栈帧 *)
-    Sw (Ra, frame_size-4, Sp);   (* ra保存到fp-4 *)
-    Sw (Fp, frame_size-8, Sp);   (* fp保存到fp-8 *)  
-    Addi (Fp, Sp, frame_size)    (* fp = sp + frame_size *)
-  ] in
-  
-  (* 被调用者保存临时寄存器T0-T6 *)
-  prologue @ save_temp_regs ctx
+  [ Addi (Sp, Sp, -frame_size);  (* 分配整个栈帧 *)
+    Sw (Ra, frame_size-4, Sp);   (* 保存ra *)
+    Sw (Fp, frame_size-8, Sp);   (* 保存fp *)  
+    Addi (Fp, Sp, frame_size) ]  (* 设置新fp *)
+  @ save_temp_regs ctx
 
-(* 函数尾声 - 恢复临时寄存器(T0-T6)、ra和fp并释放栈帧 *)
 let gen_epilogue_instrs ctx frame_size =
-  (* 被调用者恢复临时寄存器恢复临时寄存器T0-T6，然后恢复ra和fp *)
   restore_temp_regs ctx @ [
     Lw (Ra, frame_size-4, Sp);   (* 恢复ra *)
     Lw (Fp, frame_size-8, Sp);   (* 恢复fp *)
-    Addi (Sp, Sp, frame_size);   (* 释放整个栈帧 *)
+    Addi (Sp, Sp, frame_size);   (* 释放栈帧 *)
     Ret ]                        (* 返回 *)
 
 (* 语句生成逻辑 *)
@@ -590,7 +533,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
   | Ast.Empty -> []
   
   | Ast.ExprStmt e ->
-    let reg, instrs = gen_expr ctx e in
+    let (reg, instrs) = gen_expr ctx e in
     let items = List.map (fun i -> Instruction i) instrs in
     release_temp_reg ctx reg;
     items
@@ -599,23 +542,22 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let old_vars = ctx.local_vars in
     let old_offset = ctx.stack_offset in
     let old_call_offset = ctx.call_result_offset in
-    let old_spill_offset = ctx.spill_stack_offset in
     let old_total_locals = !(ctx.total_locals) in
-    let old_reg_statuses = ctx.reg_statuses in
-    let old_timestamp = ctx.timestamp in
+    let old_temp_regs = ctx.temp_regs in
+    let old_spill_offset = ctx.spill_offset in
+    let old_spill_map = ctx.spill_map in
     let items = List.map (gen_stmt ctx) stmts |> List.flatten in
     ctx.local_vars <- old_vars;
     ctx.stack_offset <- old_offset;
     ctx.call_result_offset <- old_call_offset;
-    ctx.spill_stack_offset <- old_spill_offset;
     ctx.total_locals := old_total_locals;
-    ctx.reg_statuses <- old_reg_statuses;
-    ctx.timestamp <- old_timestamp;
+    ctx.temp_regs <- old_temp_regs;
+    ctx.spill_offset <- old_spill_offset;
+    ctx.spill_map <- old_spill_map;
     items
   
   | Ast.Return (Some e) ->
-    let e_reg, e_instrs = gen_expr ctx e in
-    (* 函数返回值放入A0 *)
+    let (e_reg, e_instrs) = gen_expr ctx e in
     let all_instrs = 
       e_instrs @ [ Mv (A0, e_reg) ] @ gen_epilogue_instrs ctx ctx.frame_size 
     in
@@ -627,7 +569,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
       ([ Li (A0, 0) ] @ gen_epilogue_instrs ctx ctx.frame_size)
   
   | Ast.If (cond, then_stmt, else_stmt) ->
-    let cond_reg, cond_instrs = gen_expr ctx cond in
+    let (cond_reg, cond_instrs) = gen_expr ctx cond in
     let else_label = new_label ctx "else" in
     let end_label = new_label ctx "endif" in
     let then_items = gen_stmt ctx then_stmt in
@@ -645,7 +587,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let end_label = new_label ctx "endloop" in
     ctx.break_labels <- end_label :: ctx.break_labels;
     ctx.continue_labels <- loop_label :: ctx.continue_labels;
-    let cond_reg, cond_instrs = gen_expr ctx cond in
+    let (cond_reg, cond_instrs) = gen_expr ctx cond in
     let body_items = gen_stmt ctx body in
     ctx.break_labels <- List.tl ctx.break_labels;
     ctx.continue_labels <- List.tl ctx.continue_labels;
@@ -667,22 +609,21 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
      | [] -> failwith "Continue outside loop")
   
   | Ast.Decl (name, e) ->
-    let offset = add_local_var ctx name in  (* 分配到局部变量区 *)
-    let e_reg, e_instrs = gen_expr ctx e in
+    let offset = add_local_var ctx name in
+    let (e_reg, e_instrs) = gen_expr ctx e in
     let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in
     release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
   
   | Ast.Assign (name, e) ->
     let offset = get_var_offset ctx name in
-    let e_reg, e_instrs = gen_expr ctx e in
+    let (e_reg, e_instrs) = gen_expr ctx e in
     let all_instrs = e_instrs @ [ Sw (e_reg, offset, Fp) ] in
     release_temp_reg ctx e_reg;
     List.map (fun i -> Instruction i) all_instrs
 
-(* 栈帧大小计算 - 包含临时溢出区 *)
+(* 栈帧大小计算 - 包含溢出区 *)
 let calculate_frame_size_and_offsets (func_def : Ast.func_def) =
-  (* 统计局部变量数量 *)
   let rec count_decls_in_stmt (stmt:Ast.stmt) =
     match stmt with
     | Decl _ -> 1
@@ -695,31 +636,19 @@ let calculate_frame_size_and_offsets (func_def : Ast.func_def) =
   let num_locals = List.fold_left (fun acc stmt -> acc + count_decls_in_stmt stmt) 0 func_def.body in
   let locals_area_size = num_locals * 4 in
   
-  (* 栈帧布局从高地址到低地址:
-     1. 栈参数区: sp+0 到 sp+255 (256字节)
-     2. 临时寄存器保存区: 28字节 (T0-T6)
-     3. 临时溢出区: 1024字节 (新增)
-     4. 函数调用结果保存区: 32字节
-     5. 局部变量区: locals_area_size 字节
-     6. 返回值保存区: 4字节
-     7. 参数区: 256字节
-     8. ra和fp保存区: 8字节
-  *)
-  
-  (* 计算总栈帧大小 *)
+  (* 总栈帧大小包含溢出区 *)
   let frame_size = 
     stack_args_area_size +        (* 256字节 *)
-    temp_regs_save_size +         (* 28字节 *)
-    spill_area_size +             (* 1024字节 (新增) *)
+    temp_regs_save_size +         (* 临时寄存器保存区28字节 *)
     call_results_area_size +      (* 32字节 *)
     locals_area_size +            (* 局部变量大小 *)
-    ret_val_area_size +           (* 4字节 *)
+    ret_val_area_size +           (* 返回值保存区4字节 *)
     params_area_size +            (* 256字节 *)
-    8                             (* ra和fp *)
+    8 +                           (* ra和fp (2个寄存器) *)
+    spill_area_size               (* 寄存器溢出区128字节 *)
   in
   
-  (* 计算各区域偏移 (相对fp) *)
-  let stack_args_offset = 0 in  (* 栈参数区从sp+0开始 *)
+  let stack_args_offset = 0 in
   let ret_val_offset = -(locals_area_size + params_area_size + 8) in
   
   (frame_size, call_results_area_size, ret_val_offset, stack_args_offset)
@@ -731,17 +660,14 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   let ctx = create_context symbol_table func_def.fname frame_size 
       call_results_area_size ret_val_offset stack_args_offset spill_area_size in
   
-  (* 函数序言 *)
   let prologue = List.map (fun i -> Instruction i) (gen_prologue_instrs ctx frame_size) in
   
-  (* 处理参数 *)
   let param_instrs =
     List.mapi
       (fun i { Ast.pname = name; _ } ->
        let param_offset = add_param_var ctx name i in
        let instr =
          if i < 8 then
-           (* 前8个参数从A0-A7寄存器保存到参数区 *)
            let arg_reg =
              match i with
              | 0 -> A0 | 1 -> A1 | 2 -> A2 | 3 -> A3
@@ -750,7 +676,6 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
            in
            [ Instruction (Sw (arg_reg, param_offset, Fp)) ]
          else
-           (* 第9+个参数从调用者栈参数区加载 *)
            let stack_arg_offset = ((i - 8) * 4) in
            [ Instruction (Lw (T0, stack_arg_offset, Sp));
              Instruction (Sw (T0, param_offset, Fp)) ]
@@ -760,29 +685,24 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
     |> List.flatten
   in
   
-  (* 生成函数体 *)
   let body_items =
     func_def.body
     |> List.map (fun s -> gen_stmt ctx s)
     |> List.flatten
   in
   
-  (* 检查是否有显式return *)
   let has_explicit_return =
     List.exists (function Instruction Ret -> true | _ -> false) body_items
   in
   
-  (* 隐式return处理 *)
   let epilogue =
     if has_explicit_return then []
     else List.map (fun i -> Instruction i) (gen_epilogue_instrs ctx frame_size)
   in
   
-  (* 组合所有部分 *)
   [ Label func_def.fname; Comment ("Function: " ^ func_def.fname);
     Comment ("Frame size: " ^ string_of_int frame_size ^ " bytes");
-    Comment ("Spill area size: " ^ string_of_int spill_area_size ^ " bytes");
-    Comment ("Temp registers save area: " ^ string_of_int temp_regs_save_size ^ " bytes") ]
+    Comment ("包含寄存器溢出区: " ^ string_of_int spill_area_size ^ " bytes") ]
   @ prologue 
   @ param_instrs 
   @ body_items 
@@ -793,17 +713,8 @@ let gen_program symbol_table (program : Ast.program) =
   [ Directive ".text"; 
     Directive ".globl main"; 
     Directive ".align 2";
-    Comment "Generated by RISC-V Code Generator (带寄存器溢出机制)";
-    Comment "Stack layout from high to low address:";
-    Comment "1. 栈参数区: sp+0 ~ sp+255 (256字节)";
-    Comment "2. 临时寄存器保存区: 28字节 (T0-T6，被调用者管理)";
-    Comment "3. 临时溢出区: 1024字节 (寄存器不足时保存中间值)";
-    Comment "4. 函数调用结果保存区: 32字节";
-    Comment "5. 局部变量区";
-    Comment "6. 返回值保存区 (4字节)";
-    Comment "7. 参数区 (256字节)";
-    Comment "8. ra (fp-4) 和 旧fp (fp-8)";
-    Comment "临时寄存器不足时自动溢出到栈，确保中间值不被覆盖" ]
+    Comment "支持寄存器溢出的RISC-V代码生成器";
+    Comment "栈布局包含寄存器溢出区，解决临时寄存器冲突问题" ]
   @ List.flatten (List.map (gen_function symbol_table) program)
 
 
@@ -814,6 +725,7 @@ let compile_to_riscv symbol_table program =
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
