@@ -727,7 +727,13 @@ let gen_program symbol_table (program : Ast.program) =
   @ List.flatten (List.map (gen_function symbol_table) program)
 
 
-
+let compile_to_riscv out_chan symbol_table program =
+  let asm_items = gen_program symbol_table program in
+  List.iter
+    (fun item ->
+       output_string out_chan (asm_item_to_string item);
+       output_string out_chan "\n")
+    asm_items  
 
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
@@ -735,6 +741,7 @@ let compile_to_riscv symbol_table program =
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
