@@ -32,7 +32,7 @@ let () =
     let checked_ast = Semantic.check_program ast in  (* 修正：只接收一个返回值 *)
     
     (* 优化处理 *)
-    let optimized_ast = if optimize then Optimize.fold_constants checked_ast else checked_ast in
+    let optimized_ast = if optimize then Optimize.optimize checked_ast else checked_ast in
     
     (* 代码生成并输出到标准输出 *)
     (* 假设symbol_table由其他方式获取或不需要，这里直接传递空表或调整参数 *)
@@ -50,4 +50,5 @@ let () =
   | e ->
       Printf.eprintf "未知错误: %s\n" (Printexc.to_string e);
       exit 1
+
 
