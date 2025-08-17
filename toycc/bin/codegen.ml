@@ -270,7 +270,7 @@ let params_start_offset = -12       (* 参数区起始偏移: fp-12 *)
 let params_end_offset = params_start_offset - params_area_size  (* fp-268 *)
 let ret_val_area_size = 4           (* 返回值保存区4字节 *)
 let stack_args_area_size = 256      (* 栈参数区固定256字节，从sp+0开始 *)
-let call_results_area_size = 128   (* 函数调用结果保存区1024字节 *)
+let call_results_area_size = 256   (* 函数调用结果保存区1024字节 *)
 
 (* 创建上下文 - 初始化函数调用结果保存区 *)
 let create_context _symbol_table func_name frame_size call_results_area_size 
@@ -735,6 +735,7 @@ let compile_to_riscv symbol_table program =
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
