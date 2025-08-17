@@ -283,7 +283,7 @@ let params_end_offset = params_start_offset - params_area_size  (* fp-268 *)
 let ret_val_area_size = 4           (* 返回值保存区4字节 *)
 let stack_args_area_size = 256      (* 栈参数区固定256字节 *)
 let call_results_area_size = 512     (* 函数调用结果保存区 *)
-let spill_area_size = 64          (* 寄存器溢出区大小，可根据需要调整 *)
+let spill_area_size = 128          (* 寄存器溢出区大小，可根据需要调整 *)
 
 (* 创建上下文 - 初始化寄存器溢出管理 *)
 let create_context _symbol_table func_name frame_size call_results_area_size 
@@ -762,7 +762,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
          else
            (* 第9+个参数从调用者栈参数区加载 (sp+0开始) *)
            let stack_arg_offset = ((i - 8) * 4) in  (* sp+0开始的偏移 *)
-           let load_instr = Lw (T0, Sp, stack_arg_offset) in
+           let load_instr = Lw (T0, Fp, stack_arg_offset) in
            let store_instr = Sw (T0, Fp, param_offset) in
            [ Instruction load_instr; Instruction store_instr ]
        in
@@ -820,12 +820,14 @@ let gen_program symbol_table (program : Ast.program) =
 
 
 
+
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
