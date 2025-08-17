@@ -394,6 +394,5 @@ let eliminate_dead_code program =
 (* 完整的优化流程 *)
 let optimize program =
   program
-  |> fold_constants
-  |> propagate_constants
-  |> eliminate_dead_code
+  
+
