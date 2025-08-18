@@ -1,5 +1,6 @@
 
 
-let optimize (program: program) : program =
+let optimize  program =
   program
+
 
