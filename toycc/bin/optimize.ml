@@ -392,11 +392,12 @@ let eliminate_dead_code program =
   ) program
 
 (* 完整的优化流程 *)
-let optimize1 program =
+let optimize program =
   program
   |> fold_constants
   |> eliminate_dead_code
 
 
-  let optimize program=program
+
+
 
