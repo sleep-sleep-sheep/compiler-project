@@ -1,6 +1,4 @@
-open Ast
-
-(* 常量折叠优化 - 增强版 *)
+(* 常量折叠优化 *)
 let rec fold_constants_expr expr =
   match expr with
   | Literal _ -> expr
@@ -14,17 +12,9 @@ let rec fold_constants_expr expr =
             | "+" -> n1 + n2
             | "-" -> n1 - n2
             | "*" -> n1 * n2
-            | "/" -> if n2 = 0 then 0 else n1 / n2  (* 避免除零错误 *)
-            | "%" -> if n2 = 0 then 0 else n1 mod n2
-            | "<" -> if n1 < n2 then 1 else 0
-            | ">" -> if n1 > n2 then 1 else 0
-            | "<=" -> if n1 <= n2 then 1 else 0
-            | ">=" -> if n1 >= n2 then 1 else 0
-            | "==" -> if n1 = n2 then 1 else 0
-            | "!=" -> if n1 != n2 then 1 else 0
-            | "&&" -> if n1 != 0 && n2 != 0 then 1 else 0
-            | "||" -> if n1 != 0 || n2 != 0 then 1 else 0
-            | _ -> 0  (* 不支持的运算符不折叠 *)
+            | "/" -> n1 / n2
+            | "%" -> n1 mod n2
+            | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
           in
           Literal (IntLit result)
       | _ -> BinOp (e1', op, e2')
@@ -36,20 +26,19 @@ let rec fold_constants_expr expr =
           let result = match op with
             | "-" -> -n
             | "!" -> if n = 0 then 1 else 0
-            | "+" -> n
-            | _ -> 0
+            | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
           in
           Literal (IntLit result)
       | _ -> UnOp (op, e')
       end
   | Call (fname, args) ->
-      Call (fname, List.map fold_constants_expr args)
+      let args' = List.map fold_constants_expr args in
+      Call (fname, args')
   | Paren e ->
       let e' = fold_constants_expr e in
-      (match e' with  (* 移除冗余括号 *)
-       | Paren e'' -> e''
-       | _ -> Paren e')
+      Paren e'
 
+(* 常量折叠优化语句 *)
 let rec fold_constants_stmt stmt =
   match stmt with
   | Block stmts ->
@@ -75,62 +64,47 @@ let rec fold_constants_stmt stmt =
   | Return expr_opt ->
       Return (Option.map fold_constants_expr expr_opt)
 
+(* 常量折叠优化程序 *)
 let fold_constants program =
   List.map (fun func ->
     { func with body = List.map fold_constants_stmt func.body }
   ) program
 
 
-(* 常量传播优化 - 修正版 *)
+(* 常量传播优化 *)
 type var_status =
-  | Const of literal
-  | Top
+  | Const of literal  (* 变量持有常量值 *)
+  | Top               (* 变量值未知或不可预测 *)
 
+(* 明确定义环境类型为从字符串到var_status的映射 *)
 module VarEnv = Map.Make(String)
 type env = var_status VarEnv.t
 
+(* 初始化环境为明确的var_status映射类型 *)
 let init_env : env = VarEnv.empty
 
-let rec expr_to_const (env : env) expr : var_status option =
+(* 表达式转常量状态 - 明确返回var_status option类型 *)
+let expr_to_const (env : env) expr : var_status option =
   match expr with
-  | Literal lit -> Some (Const lit)
-  | Var id -> 
-      (match VarEnv.find_opt id env with
-       | Some (Const lit) -> Some (Const lit)
-       | _ -> None)
-  | BinOp (e1, op, e2) ->
-      (match expr_to_const env e1, expr_to_const env e2 with
-       | Some (Const (IntLit n1)), Some (Const (IntLit n2)) ->
-           (try 
-             let result = match op with
-               | "+" -> n1 + n2
-               | "-" -> n1 - n2
-               | "*" -> n1 * n2
-               | "/" -> if n2 = 0 then raise Exit else n1 / n2
-               | "%" -> if n2 = 0 then raise Exit else n1 mod n2
-               | _ -> raise Exit
-             in
-             Some (Const (IntLit result))
-            with Exit -> None)
-       | _ -> None)
+  | Literal lit -> Some (Const lit)  (* 返回包装在Const中的literal *)
+  | Var id -> VarEnv.find_opt id env
   | _ -> None
 
+(* 分析语句并更新环境 - 确保输入输出都是env类型 *)
 let rec analyze_stmt (env : env) stmt : env =
   match stmt with
   | Empty | Break | Continue | Return _ -> env
   | ExprStmt _ -> env
   | Assign (id, expr) ->
-      (match expr_to_const env expr with
-       | Some const_val -> VarEnv.add id const_val env
-       | None -> VarEnv.add id Top env)
+      begin match expr_to_const env expr with
+      | Some const_val -> VarEnv.add id const_val env  (* 添加var_status类型的值 *)
+      | None -> VarEnv.add id Top env
+      end
   | Decl (id, expr) ->
-      (match expr_to_const env expr with
-       | Some const_val -> 
-           if VarEnv.mem id env then env
-           else VarEnv.add id const_val env
-       | None -> 
-           if VarEnv.mem id env then env
-           else VarEnv.add id Top env)
+      begin match expr_to_const env expr with
+      | Some const_val -> VarEnv.add id const_val env  (* 添加var_status类型的值 *)
+      | None -> VarEnv.add id Top env
+      end
   | If (_, then_stmt, else_stmt_opt) ->
       let then_env = analyze_stmt env then_stmt in
       let else_env = 
@@ -141,30 +115,22 @@ let rec analyze_stmt (env : env) stmt : env =
       VarEnv.merge (fun _ v1 v2 ->
         match v1, v2 with
         | Some (Const l1), Some (Const l2) when l1 = l2 -> Some (Const l1)
-        | Some (Const _), Some (Const _) -> Some Top
-        | Some Top, Some Top -> Some Top
-        | Some Top, Some (Const _) | Some (Const _), Some Top -> Some Top
-        | Some v, None | None, Some v -> Some v
-        | None, None -> None
+        | _ -> Some Top
       ) then_env else_env
-  | While (_, body) ->
-      let body_env = analyze_stmt env body in
-      VarEnv.merge (fun _ env_val body_val ->
-        match env_val, body_val with
-        | Some (Const l), Some (Const l') when l = l' -> Some (Const l)
-        | Some v, _ -> Some v
-        | None, _ -> body_val
-      ) env body_env
+  | While (_, _) ->
+      VarEnv.map (fun _ -> Top) env
   | Block stmts ->
       List.fold_left analyze_stmt env stmts
 
+(* 在表达式中替换变量为常量 *)
 let rec replace_vars_in_expr (env : env) expr =
   match expr with
   | Literal _ -> expr
   | Var id ->
-      (match VarEnv.find_opt id env with
-       | Some (Const lit) -> Literal lit
-       | _ -> expr)
+      begin match VarEnv.find_opt id env with
+      | Some (Const lit) -> Literal lit
+      | _ -> expr
+      end
   | BinOp (e1, op, e2) ->
       BinOp (replace_vars_in_expr env e1, op, replace_vars_in_expr env e2)
   | UnOp (op, e) ->
@@ -174,6 +140,7 @@ let rec replace_vars_in_expr (env : env) expr =
   | Paren e ->
       Paren (replace_vars_in_expr env e)
 
+(* 在语句中应用常量传播 *)
 let rec propagate_in_stmt (env : env) stmt =
   match stmt with
   | Block stmts ->
@@ -200,47 +167,46 @@ let rec propagate_in_stmt (env : env) stmt =
       If (cond', then_stmt', else_stmt_opt')
   | While (cond, body) ->
       let cond' = replace_vars_in_expr env cond in
-      let body_env = analyze_stmt env body in
-      let merged_env = VarEnv.merge (fun _ e1 e2 ->
-        match e1, e2 with Some v, _ -> Some v | None, e -> e) env body_env in
-      let body' = propagate_in_stmt merged_env body in
+      let body' = propagate_in_stmt env body in
       While (cond', body')
   | Break -> Break
   | Continue -> Continue
   | Return expr_opt ->
       Return (Option.map (replace_vars_in_expr env) expr_opt)
 
+(* 在语句列表中应用常量传播 *)
 and propagate_in_stmts env stmts =
   List.fold_left (fun (stmts_acc, env_acc) stmt ->
     let stmt' = propagate_in_stmt env_acc stmt in
     let new_env = analyze_stmt env_acc stmt' in
     (stmt' :: stmts_acc, new_env)
   ) ([], env) stmts
-  |> fun (stmts', env') -> (List.rev stmts', env')
+  |> fun (stmts', _) -> (List.rev stmts', env)
 
+(* 常量传播优化程序 *)
 let propagate_constants program =
   List.map (fun func ->
-    let param_env = List.fold_left (fun env param ->
-      VarEnv.add param.pname Top env
-    ) init_env func.params in
-    let body', _ = propagate_in_stmts param_env func.body in
+    let env = init_env in
+    let body', _ = propagate_in_stmts env func.body in
     { func with body = body' }
   ) program
 
 
-(* 死代码消除 - 增强版 *)
+(* 死代码消除 *)
 module VarSet = Set.Make(String)
 
+(* 判断表达式是否为常量真/假 *)
 let is_const_true expr =
-  match fold_constants_expr expr with
+  match expr with
   | Literal (IntLit n) -> n != 0
   | _ -> false
 
 let is_const_false expr =
-  match fold_constants_expr expr with
+  match expr with
   | Literal (IntLit 0) -> true
   | _ -> false
 
+(* 移除不可达语句 *)
 let rec eliminate_dead_stmt reachable stmt =
   if not reachable then (None, false)
   else
@@ -300,6 +266,7 @@ and eliminate_dead_stmts reachable stmts =
       in
       (stmts', rest_reachable)
 
+(* 收集所有被使用的变量 *)
 let rec collect_vars_expr vars expr =
   match expr with
   | Literal _ -> vars
@@ -318,12 +285,8 @@ let rec collect_vars_stmt vars stmt =
       List.fold_left collect_vars_stmt vars stmts
   | Empty -> vars
   | ExprStmt expr -> collect_vars_expr vars expr
-  | Assign (id, expr) -> 
-      let vars = collect_vars_expr vars expr in
-      VarSet.add id vars
-  | Decl (id, expr) -> 
-      let vars = collect_vars_expr vars expr in
-      VarSet.add id vars
+  | Assign (_, expr) -> collect_vars_expr vars expr
+  | Decl (_, expr) -> collect_vars_expr vars expr
   | If (cond, then_stmt, else_stmt_opt) ->
       let vars = collect_vars_expr vars cond in
       let vars = collect_vars_stmt vars then_stmt in
@@ -341,6 +304,7 @@ let rec collect_vars_stmt vars stmt =
       | None -> vars
       end
 
+(* 移除未使用的变量 *)
 let rec remove_unused_stmt used_vars stmt =
   match stmt with
   | Block stmts ->
@@ -384,6 +348,7 @@ and remove_unused_expr used_vars expr =
   | Paren e ->
       Paren (remove_unused_expr used_vars e)
 
+(* 简化空语句和空块 *)
 let rec simplify_empty_stmt stmt =
   match stmt with
   | Block stmts ->
@@ -406,105 +371,26 @@ let rec simplify_empty_stmt stmt =
       While (cond, body')
   | _ -> stmt
 
+(* 死代码消除主函数 *)
 let eliminate_dead_code program =
   List.map (fun func ->
-    let param_vars = List.fold_left (fun vars param ->
-      VarSet.add param.pname vars
-    ) VarSet.empty func.params in
-    
+    (* 1. 移除不可达语句 *)
     let body_reachable, _ = eliminate_dead_stmts true func.body in
-    let used_vars = List.fold_left collect_vars_stmt param_vars body_reachable in
+    
+    (* 2. 收集使用的变量 *)
+    let used_vars = List.fold_left collect_vars_stmt VarSet.empty body_reachable in
+    
+    (* 3. 移除未使用的变量声明和赋值 *)
     let body_unused_removed = List.map (remove_unused_stmt used_vars) body_reachable in
+    
+    (* 4. 简化空语句和空块 *)
     let body_simplified = List.map simplify_empty_stmt body_unused_removed in
     
     { func with body = body_simplified }
   ) program
 
-
-(* 语义等价判断函数 - 用于优化终止条件 *)
-let rec expr_equal e1 e2 =
-  match e1, e2 with
-  | Paren e1', Paren e2' -> expr_equal e1' e2'
-  | Paren e1', e2' -> expr_equal e1' e2'  (* 忽略括号差异 *)
-  | e1', Paren e2' -> expr_equal e1' e2'
-  | Literal l1, Literal l2 -> l1 = l2
-  | Var id1, Var id2 -> id1 = id2
-  | BinOp (a1, op1, b1), BinOp (a2, op2, b2) ->
-      op1 = op2 && expr_equal a1 a2 && expr_equal b1 b2
-  | UnOp (op1, a1), UnOp (op2, a2) ->
-      op1 = op2 && expr_equal a1 a2
-  | Call (f1, args1), Call (f2, args2) ->
-      f1 = f2 && List.for_all2 expr_equal args1 args2
-  | _ -> false
-
-let rec stmt_equal s1 s2 =
-  match s1, s2 with
-  | Block b1, Block b2 -> List.for_all2 stmt_equal b1 b2
-  | Empty, Empty -> true
-  | ExprStmt e1, ExprStmt e2 -> expr_equal e1 e2
-  | Assign (id1, e1), Assign (id2, e2) -> id1 = id2 && expr_equal e1 e2
-  | Decl (id1, e1), Decl (id2, e2) -> id1 = id2 && expr_equal e1 e2
-  | If (c1, t1, e1), If (c2, t2, e2) ->
-      expr_equal c1 c2 && stmt_equal t1 t2 && 
-      Option.equal stmt_equal e1 e2
-  | While (c1, b1), While (c2, b2) ->
-      expr_equal c1 c2 && stmt_equal b1 b2
-  | Break, Break -> true
-  | Continue, Continue -> true
-  | Return e1, Return e2 -> Option.equal expr_equal e1 e2
-  | _ -> false
-
-let func_equal f1 f2 =
-  f1.fname = f2.fname &&
-  List.for_all2 (fun p1 p2 -> p1.pname = p2.pname) f1.params f2.params &&
-  List.for_all2 stmt_equal f1.body f2.body
-
-let program_equal p1 p2 =
-  List.for_all2 func_equal p1 p2
-
-
-(* 优化流程 - 带最大迭代次数限制 *)
-let rec optimize_iteration max_iter program =
-  if max_iter <= 0 then program  (* 达到最大迭代次数，强制退出 *)
-  else
-    let program' = 
-      program
-      |> fold_constants
-      |> propagate_constants
-      |> eliminate_dead_code
-    in
-    if program_equal program program' then program'  (* 使用语义等价判断 *)
-    else optimize_iteration (max_iter - 1) program'  (* 减少迭代次数 *)
-
-(* 主优化函数 *)
+(* 完整的优化流程 *)
 let optimize program =
-  let preserve_tail_recursion program =
-    List.map (fun func ->
-      let is_tail_recursive = ref false in
-      let rec check_tail_recursion in_tail stmt =
-        match stmt with
-        | Return (Some (Call (fname, _))) when fname = func.fname ->
-            is_tail_recursive := true
-        | Return _ -> ()
-        | Block stmts ->
-            List.iter (check_tail_recursion true) stmts
-        | If (_, then_stmt, Some else_stmt) ->
-            check_tail_recursion in_tail then_stmt;
-            check_tail_recursion in_tail else_stmt
-        | If (_, then_stmt, None) ->
-            check_tail_recursion in_tail then_stmt
-        | While (_, body) ->
-            check_tail_recursion false body
-        | ExprStmt _ | Assign _ | Decl _ -> if in_tail then ()
-        | Break | Continue -> ()
-        | Empty -> ()
-      in
-      List.iter (check_tail_recursion false) func.body;
-      if !is_tail_recursive then func else func
-    ) program
-  in
-  
   program
-  |> preserve_tail_recursion
-  |> optimize_iteration 3  (* 限制最大迭代次数为5次 *)
-    
+  |> fold_constants
+  |> eliminate_dead_code
