@@ -1,3 +1,5 @@
+open Ast
+
 (* 常量折叠优化 *)
 let rec fold_constants_expr expr =
   match expr with
