@@ -570,7 +570,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     (* 3. 函数调用并由调用者将返回值(A0)保存到栈上 *)
     let call_instr = [ 
       Jal (Ra, fname); 
-      Mv(result_reg,a0);
+      Mv(result_reg,A0);
     ] in
     
     (* 4. 返回结果寄存器和完整指令序列 *)
@@ -835,6 +835,7 @@ let compile_to_riscv symbol_table program =
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
