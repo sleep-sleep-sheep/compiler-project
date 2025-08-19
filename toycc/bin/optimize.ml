@@ -1,6 +1,6 @@
 open Ast
 
-(* 常量折叠优化 *)
+(* 强化版常量折叠优化 *)
 let rec fold_constants_expr expr =
   match expr with
   | Literal _ -> expr
@@ -26,12 +26,15 @@ let rec fold_constants_expr expr =
             | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
           in
           Literal (IntLit result)
-      (* 部分折叠优化 *)
+      (* 扩展部分折叠规则集 *)
       | e, Literal (IntLit 0) when op = "+" -> e  (* x + 0 → x *)
       | Literal (IntLit 0), e when op = "+" -> e  (* 0 + x → x *)
       | e, Literal (IntLit 0) when op = "-" -> e  (* x - 0 → x *)
+      | Literal (IntLit 0), e when op = "-" -> UnOp ("-", e)  (* 0 - x → -x *)
       | Literal (IntLit 1), e when op = "*" -> e  (* 1 * x → x *)
       | e, Literal (IntLit 1) when op = "*" -> e  (* x * 1 → x *)
+      | _, Literal (IntLit 0) when op = "*" -> Literal (IntLit 0)  (* x * 0 → 0 *)
+      | Literal (IntLit 0), _ when op = "*" -> Literal (IntLit 0)  (* 0 * x → 0 *)
       | _ -> BinOp (e1', op, e2')
       end
   | UnOp (op, e) ->
@@ -45,6 +48,7 @@ let rec fold_constants_expr expr =
           in
           Literal (IntLit result)
       | UnOp ("!", e'') -> e''  (* !!x → x *)
+      | UnOp ("-", UnOp ("-", e'')) -> e''  (* -(-x) → x *)
       | _ -> UnOp (op, e')
       end
   | Call (fname, args) ->
@@ -52,7 +56,10 @@ let rec fold_constants_expr expr =
       Call (fname, args')
   | Paren e ->
       let e' = fold_constants_expr e in
-      Paren e'
+      begin match e' with
+      | Paren e'' -> e''  (* 移除嵌套括号 ((x)) → x *)
+      | _ -> Paren e'
+      end
 
 let rec fold_constants_stmt stmt =
   match stmt with
@@ -85,76 +92,7 @@ let fold_constants program =
   ) program
 
 
-(* 简化版常量传播：只处理顶级常量，不迭代，不合并环境 *)
-type var_status =
-  | Const of literal  (* 变量持有常量值 *)
-  | Top               (* 变量值未知或不可预测 *)
-
-module VarEnv = Map.Make(String)
-type env = var_status VarEnv.t
-
-(* 仅收集顶级常量（声明或赋值时直接初始化的常量） *)
-let collect_top_level_constants stmts =
-  List.fold_left (fun env stmt ->
-    match stmt with
-    | Decl (id, Literal lit) -> 
-        VarEnv.add id (Const lit) env  (* 收集声明时初始化的常量 *)
-    | Assign (id, Literal lit) -> 
-        VarEnv.add id (Const lit) env  (* 收集直接赋值的常量 *)
-    | _ -> env  (* 忽略其他语句 *)
-  ) VarEnv.empty stmts
-
-(* 仅替换已知的顶级常量，不处理复杂表达式 *)
-let rec replace_top_level_vars env expr =
-  match expr with
-  | Var id ->
-      begin match VarEnv.find_opt id env with
-      | Some (Const lit) -> Literal lit  (* 替换常量变量 *)
-      | _ -> expr  (* 非常量变量不替换 *)
-      end
-  | BinOp (e1, op, e2) ->
-      BinOp (replace_top_level_vars env e1, op, replace_top_level_vars env e2)
-  | UnOp (op, e) ->
-      UnOp (op, replace_top_level_vars env e)
-  | Call (fname, args) ->
-      Call (fname, List.map (replace_top_level_vars env) args)
-  | Paren e ->
-      Paren (replace_top_level_vars env e)
-  | Literal _ -> expr  (* 常量不处理 *)
-
-(* 在语句中应用简化的常量传播 *)
-let rec propagate_in_stmt env stmt =
-  match stmt with
-  | Block stmts ->
-      Block (List.map (propagate_in_stmt env) stmts)
-  | Empty -> Empty
-  | ExprStmt expr ->
-      ExprStmt (replace_top_level_vars env expr)
-  | Assign (id, expr) ->
-      Assign (id, replace_top_level_vars env expr)
-  | Decl (id, expr) ->
-      Decl (id, replace_top_level_vars env expr)
-  | If (cond, then_stmt, else_stmt_opt) ->
-      let cond' = replace_top_level_vars env cond in
-      If (cond', propagate_in_stmt env then_stmt, 
-          Option.map (propagate_in_stmt env) else_stmt_opt)
-  | While (cond, body) ->
-      While (replace_top_level_vars env cond, propagate_in_stmt env body)
-  | Break -> Break
-  | Continue -> Continue
-  | Return expr_opt ->
-      Return (Option.map (replace_top_level_vars env) expr_opt)
-
-(* 简化版常量传播入口 *)
-let propagate_constants program =
-  List.map (fun func ->
-    let top_env = collect_top_level_constants func.body in  (* 只收集顶级常量 *)
-    let body' = List.map (propagate_in_stmt top_env) func.body in
-    { func with body = body' }
-  ) program
-
-
-(* 强化版死代码消除 *)
+(* 增强版死代码消除 *)
 module VarSet = Set.Make(String)
 
 let is_const_true expr =
@@ -167,7 +105,7 @@ let is_const_false expr =
   | Literal (IntLit 0) -> true
   | _ -> false
 
-(* 移除不可达语句（增加深度处理） *)
+(* 移除不可达语句 *)
 let rec eliminate_dead_stmt reachable stmt =
   if not reachable then (None, false)
   else
@@ -337,7 +275,7 @@ let rec simplify_empty_stmt stmt =
       While (cond, body')
   | _ -> stmt
 
-(* 强化版死代码消除入口 *)
+(* 增强版死代码消除入口 *)
 let eliminate_dead_code program =
   List.map (fun func ->
     (* 1. 第一次消除不可达语句 *)
@@ -358,9 +296,8 @@ let eliminate_dead_code program =
     { func with body = body_simplified }
   ) program
 
-(* 完整的优化流程 *)
+(* 完整的优化流程 - 不包含常量传播 *)
 let optimize program =
   program 
   |> fold_constants        (* 强化的常量折叠 *)
-  |> propagate_constants   (* 简化的常量传播 *)
   |> eliminate_dead_code   (* 强化的死代码消除 *)
