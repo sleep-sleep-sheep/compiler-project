@@ -99,8 +99,8 @@ type instruction =
   | Slti of reg * reg * int 
   | Sltu of reg * reg * reg 
   | Sltiu of reg * reg * int 
-  | Lw of reg * reg * int  (* 修改为 reg * base_reg * offset 形式 *)
-  | Sw of reg * reg * int  (* 修改为 reg * base_reg * offset 形式 *)
+  | Lw of reg * reg * int  (* reg * base_reg * offset 形式 *)
+  | Sw of reg * reg * int  (* reg * base_reg * offset 形式 *)
   | Beq of reg * reg * string 
   | Bne of reg * reg * string 
   | Blt of reg * reg * string 
@@ -261,6 +261,7 @@ type codegen_context =
   ; stack_args_offset : int       (* 栈参数区起始偏移 (相对sp) *)
   ; spill_area_size : int         (* 寄存器溢出区大小 *)
   ; mutable is_tail_call : bool   (* 是否处于尾调用位置 *)
+  ; param_count : int             (* 参数数量，用于尾递归检查 *)
   }
 
 (* 定义临时寄存器列表 - 被调用者保存 *)
@@ -282,7 +283,7 @@ let spill_area_size = 256           (* 优化：溢出区大小 *)
 
 (* 创建上下文 - 初始化寄存器溢出管理 *)
 let create_context _symbol_table func_name frame_size call_results_area_size 
-    ret_val_offset stack_args_offset spill_area_size =
+    ret_val_offset stack_args_offset spill_area_size param_count =
   let initial_spill_offset = params_end_offset - spill_area_size in
   { label_counter = 0;
     temp_counter = 0;
@@ -305,6 +306,7 @@ let create_context _symbol_table func_name frame_size call_results_area_size
     stack_args_offset = stack_args_offset;
     spill_area_size = spill_area_size;
     is_tail_call = false;
+    param_count = param_count;  (* 保存参数数量用于尾递归检查 *)
   }
 
 (* 生成新标签 *)
@@ -454,10 +456,10 @@ let restore_temp_regs ctx =
     Lw (reg, Fp, offset)
   ) temp_regs
 
-(* 检查是否为尾递归调用 - 修复类型不匹配错误 *)
+(* 修复：正确检查是否为尾递归调用 *)
 let is_tail_recursive_call ctx func_name args =
   func_name = ctx.func_name && 
-  List.length args = List.length ctx.local_vars  (* 直接比较参数数量和局部变量数量 *)
+  List.length args = ctx.param_count  (* 比较参数数量与函数定义的参数数量 *)
 
 (* 表达式生成逻辑 - 带寄存器溢出处理优化 *)
 let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
@@ -604,8 +606,8 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     in
   
     (* 2. 调用者分配栈空间保存函数调用结果 *)
-    let result_offset = alloc_call_result ctx in
-    let result_reg, spill_instrs = get_temp_reg ctx in
+    let result_offset = if do_tail_opt then 0 else alloc_call_result ctx in
+    let result_reg, spill_instrs = if do_tail_opt then (A0, []) else get_temp_reg ctx in
     
     (* 3. 函数调用并由调用者将返回值(A0)保存到栈上 *)
     let call_instr = 
@@ -666,6 +668,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let old_free_regs = !(ctx.free_regs) in
     let old_spill_stack = !(ctx.spill_stack) in
     let old_timestamp = ctx.timestamp in
+    let old_is_tail = ctx.is_tail_call in
     
     let items = List.map (gen_stmt ctx) stmts |> List.flatten in
     
@@ -679,6 +682,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     ctx.free_regs := old_free_regs;
     ctx.spill_stack := old_spill_stack;
     ctx.timestamp <- old_timestamp;
+    ctx.is_tail_call <- old_is_tail;
     
     items
   
@@ -784,7 +788,7 @@ let calculate_frame_size_and_offsets (func_def : Ast.func_def) =
     stack_args_area_size +        (* 256字节 *)
     temp_regs_save_size +         (* 临时寄存器保存区28字节 *)
     spill_area_size +             (* 寄存器溢出区 *)
-    call_results_area_size +      (* 128字节 *)
+    call_results_area_size +      (* 512字节 *)
     locals_area_size +            (* 局部变量大小 *)
     ret_val_area_size +           (* 返回值保存区4字节 *)
     params_area_size +            (* 256字节 *)
@@ -801,10 +805,11 @@ let calculate_frame_size_and_offsets (func_def : Ast.func_def) =
 
 (* 函数生成 - 支持寄存器溢出机制 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
+  let param_count = List.length func_def.params in  (* 获取参数数量 *)
   let (frame_size, call_results_area_size, ret_val_offset, stack_args_offset, spill_area_size) = 
     calculate_frame_size_and_offsets func_def in
   let ctx = create_context symbol_table func_def.fname frame_size 
-      call_results_area_size ret_val_offset stack_args_offset spill_area_size in
+      call_results_area_size ret_val_offset stack_args_offset spill_area_size param_count in
   
   (* 函数序言：一次性分配整个栈帧、设置fp并保存临时寄存器 *)
   let prologue = List.map (fun i -> Instruction i) (gen_prologue_instrs ctx frame_size) in
@@ -875,8 +880,8 @@ let gen_program symbol_table (program : Ast.program) =
     Comment "Stack layout from high to low address:";
     Comment "1. 栈参数区: sp+0 ~ sp+255 (256字节)";
     Comment "2. 临时寄存器保存区: 28字节 (保存T0-T6)";
-    Comment "3. 寄存器溢出区: 16384字节";
-    Comment "4. 函数调用结果保存区: 128字节";
+    Comment "3. 寄存器溢出区: 256字节";
+    Comment "4. 函数调用结果保存区: 512字节";
     Comment "5. 局部变量区";
     Comment "6. 返回值保存区 (4字节)";
     Comment "7. 参数区 (256字节)";
@@ -886,12 +891,14 @@ let gen_program symbol_table (program : Ast.program) =
 
 
 
+
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
