@@ -464,10 +464,11 @@ let optimize program =
       let optimized = 
         program 
         |> fold_constants
-        |> propagate_constants
+     (*   |> propagate_constants  *)
         |> eliminate_dead_code
       in
       if optimized = program then optimized
       else optimize_iter optimized (iter + 1)
   in
   optimize_iter program 0
+
