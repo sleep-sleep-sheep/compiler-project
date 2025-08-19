@@ -396,7 +396,8 @@ let optimize program =
   program
  
   |> fold_constants 
-  |>propagate_constants
+ (* |>propagate_constants *)
   |> eliminate_dead_code
+
 
 
