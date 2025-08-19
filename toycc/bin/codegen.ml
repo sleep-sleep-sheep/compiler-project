@@ -426,7 +426,7 @@ let restore_temp_regs ctx =
   ) temp_regs
 
 (* 表达式生成逻辑 - 带寄存器溢出处理优化 *)
-let rec gen_expr ctx (expr : Ast.expr) : reg * asm_item list =
+let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
   match expr with
   | Ast.Literal(IntLit n) ->
     let reg, spill_instrs = get_temp_reg ctx in
@@ -436,12 +436,12 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * asm_item list =
         let (upper, lower) = split_imm n in
         [ Lui (reg, upper); Addi (reg, reg, lower) ]
     in
-    reg, List.map (fun i -> Instruction i) spill_instrs @ List.map (fun i -> Instruction i) instrs
+    reg, spill_instrs @ instrs
 
   | Ast.Var id ->
     let reg, spill_instrs = get_temp_reg ctx in
     let offset = get_var_offset ctx id in
-    reg, List.map (fun i -> Instruction i) spill_instrs @ [ Instruction (Lw (reg, Fp, offset)) ]  (* 从fp偏移加载变量 *)
+    reg, spill_instrs @ [ Lw (reg, Fp, offset) ]  (* 从fp偏移加载变量 *)
 
   | Ast.Paren e -> gen_expr ctx e
 
@@ -455,140 +455,81 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * asm_item list =
       | "!" -> [ Sltiu (result_reg, e_reg, 1) ]
       | _ -> failwith (Printf.sprintf "Unknown unary operator: %s" op)
     in
-    let release_instrs = release_temp_reg ctx e_reg |> List.map (fun i -> Instruction i) in
-    result_reg, e_instrs @ List.map (fun i -> Instruction i) spill_instrs @ List.map (fun i -> Instruction i) op_instrs @ release_instrs
+    let release_instrs = release_temp_reg ctx e_reg in
+    result_reg, e_instrs @ spill_instrs @ op_instrs @ release_instrs
 
   | Ast.BinOp (e1, op, e2) ->
-    (match op with
-    (* =============================================================== *)
-    (* 路径1a：短路求值运算符 (&&)                                       *)
-    (* =============================================================== *)
-    | "&&" ->
-        let false_label = new_label ctx "land_false" in
-        let end_label = new_label ctx "land_end" in
-        let result_reg, spill_items = get_temp_reg ctx |> fun (r, il) -> (r, List.map (fun i -> Instruction i) il) in
-
-        (* 1. 计算 e1 *)
-        let e1_reg, e1_items = gen_expr ctx e1 in
-        let branch_item = Instruction (Beq (e1_reg, Zero, false_label)) in
-
-        (* 2. 构建 e1 为真的路径：e2_reg 的作用域 *)
-        let e1_true_path_items =
-            let e2_reg, e2_items = gen_expr ctx e2 in
-            let normalize_items = [ Instruction (Sltu (result_reg, Zero, e2_reg)) ] in
-            let release_e2_items = release_temp_reg ctx e2_reg |> List.map (fun i -> Instruction i) in
-            e2_items @ normalize_items @ release_e2_items
-        in
-        
-        (* 3. 构建 e1 为假的路径 (短路路径) *)
-        let e1_false_path_items =
-            [Label false_label; Instruction (Li (result_reg, 0))]
-        in
-
-        (* 4. 在两个路径都结束后，释放 e1_reg *)
-        let release_e1_items = release_temp_reg ctx e1_reg |> List.map (fun i -> Instruction i) in
-
-        (* 5. 组合最终的指令流 *)
-        let all_items =
-          e1_items
-          @ [branch_item]
-          @ e1_true_path_items
-          @ [Instruction (J end_label)]
-          @ e1_false_path_items
-          @ [Label end_label]
-          @ release_e1_items
-        in
-        (result_reg, spill_items @ all_items)
-
-    (* =============================================================== *)
-    (* 路径1b：短路求值运算符 (||)                                       *)
-    (* =============================================================== *)
-    | "||" ->
-        let true_label = new_label ctx "lor_true" in
-        let end_label = new_label ctx "lor_end" in
-        let result_reg, spill_items = get_temp_reg ctx |> fun (r, il) -> (r, List.map (fun i -> Instruction i) il) in
-
-        (* 1. 计算 e1 *)
-        let e1_reg, e1_items = gen_expr ctx e1 in
-        let branch_item = Instruction (Bne (e1_reg, Zero, true_label)) in
-
-        (* 2. 构建 e1 为假的路径：e2_reg 的作用域 *)
-        let e1_false_path_items =
-            let e2_reg, e2_items = gen_expr ctx e2 in
-            let normalize_items = [ Instruction (Sltu (result_reg, Zero, e2_reg)) ] in
-            let release_e2_items = release_temp_reg ctx e2_reg |> List.map (fun i -> Instruction i) in
-            e2_items @ normalize_items @ release_e2_items
-        in
-        
-        (* 3. 构建 e1 为真的路径 (短路路径) *)
-        let e1_true_path_items =
-            [Label true_label; Instruction (Li (result_reg, 1))]
-        in
-
-        (* 4. 在两个路径都结束后，释放 e1_reg *)
-        let release_e1_items = release_temp_reg ctx e1_reg |> List.map (fun i -> Instruction i) in
-
-        (* 5. 组合最终的指令流 *)
-        let all_items =
-          e1_items
-          @ [branch_item]
-          @ e1_false_path_items
-          @ [Instruction (J end_label)]
-          @ e1_true_path_items
-          @ [Label end_label]
-          @ release_e1_items
-        in
-        (result_reg, spill_items @ all_items)
-
-    (* =============================================================== *)
-    (* 路径2：所有其他标准二元运算符                                   *)
-    (* =============================================================== *)
-    | _ ->
-        let e1_reg, e1_items = gen_expr ctx e1 in
-        let e2_reg, e2_items = gen_expr ctx e2 in
-        
-        let (rs1, rs2) =
-          match op with
-          | "+" | "*" | "==" | "!=" -> (e2_reg, e1_reg)
-          | _ -> (e1_reg, e2_reg)
-        in
-        
-        let result_reg, spill_instrs = get_temp_reg ctx in
-        let op_instrs, temp_regs_used =
-            match op with
-            | "+" -> ([ Add (result_reg, rs1, rs2) ], [])
-            | "-" -> ([ Sub (result_reg, rs1, rs2) ], [])
-            | "*" -> ([ Mul (result_reg, rs1, rs2) ], [])
-            | "/" -> ([ Div (result_reg, rs1, rs2) ], [])
-            | "%" -> ([ Rem (result_reg, rs1, rs2) ], [])
-            | "==" -> ([ Sub (result_reg, rs1, rs2); Sltiu (result_reg, result_reg, 1) ], [])
-            | "!=" -> ([ Sub (result_reg, rs1, rs2); Sltu (result_reg, Zero, result_reg) ], [])
-            | "<" -> ([ Slt (result_reg, rs1, rs2) ], [])
-            | "<=" ->
-                let t0, t0_spill = get_temp_reg ctx in
-                let instrs = t0_spill @ [ Slt (t0, rs2, rs1); Xori (result_reg, t0, 1) ] in
-                (instrs, [t0])
-            | ">" -> ([ Slt (result_reg, rs2, rs1) ], [])
-            | ">=" ->
-                let t0, t0_spill = get_temp_reg ctx in
-                let instrs = t0_spill @ [ Slt (t0, rs1, rs2); Xori (result_reg, t0, 1) ] in
-                (instrs, [t0])
-            | _ -> failwith (Printf.sprintf "Unhandled binary operator in default case: %s" op)
-        in
-
-        let release_temp_instrs = List.concat_map (fun reg -> release_temp_reg ctx reg) temp_regs_used |> List.map (fun i -> Instruction i) in
-        let release_e1_instrs = release_temp_reg ctx e1_reg |> List.map (fun i -> Instruction i) in
-        let release_e2_instrs = release_temp_reg ctx e2_reg |> List.map (fun i -> Instruction i) in
-
-        let all_instrs = 
-            List.map (fun i -> Instruction i) spill_instrs @ 
-            List.map (fun i -> Instruction i) op_instrs @ 
-            release_temp_instrs @ 
-            release_e1_instrs @ 
-            release_e2_instrs
-        in
-        (result_reg, e1_items @ e2_items @ all_instrs)
-    )
+    (* 优化：对于简单运算，尝试复用寄存器减少溢出 *)
+    let e1_reg, e1_instrs = gen_expr ctx e1 in
+    let e2_reg, e2_instrs = gen_expr ctx e2 in
+    
+    (* 优化：对于 commutative 操作，选择占用寄存器更久的作为第一个操作数 *)
+    let (rs1, rs2, instrs) = 
+      match op with
+      | "+" | "*" | "&&" | "||" | "==" | "!=" ->
+        (* 交换操作数可能带来更好的寄存器利用率 *)
+        (e2_reg, e1_reg, [])
+      | _ -> (e1_reg, e2_reg, [])
+    in
+    
+    let result_reg, spill_instrs = get_temp_reg ctx in
+    let op_instrs, temp_regs_used =
+      match op with
+      | "+" -> ([ Add (result_reg, rs1, rs2) ], [])
+      | "-" -> ([ Sub (result_reg, rs1, rs2) ], [])
+      | "*" -> ([ Mul (result_reg, rs1, rs2) ], [])
+      | "/" -> ([ Div (result_reg, rs1, rs2) ], [])
+      | "%" -> ([ Rem (result_reg, rs1, rs2) ], [])
+      | "==" ->  
+          ([ Sub (result_reg, rs1, rs2); 
+             Sltiu (result_reg, result_reg, 1) ], [])
+      | "!=" -> 
+          ([ Sub (result_reg, rs1, rs2); 
+             Sltu (result_reg, Zero, result_reg) ], [])
+      | "<" -> ([ Slt (result_reg, rs1, rs2) ], [])
+      | "<=" -> 
+          let t0, t0_spill = get_temp_reg ctx in
+          let instrs = t0_spill @ [
+            Slt (t0, rs2, rs1); 
+            Xori (result_reg, t0, 1)
+          ] in
+          (instrs, [t0])
+      | ">" -> ([ Slt (result_reg, rs2, rs1) ], [])
+      | ">=" -> 
+          let t0, t0_spill = get_temp_reg ctx in
+          let instrs = t0_spill @ [
+            Slt (t0, rs1, rs2); 
+            Xori (result_reg, t0, 1)
+          ] in
+          (instrs, [t0])
+      | "&&" ->
+          let t0, t0_spill = get_temp_reg ctx in
+          let t1, t1_spill = get_temp_reg ctx in
+          let instrs = t0_spill @ t1_spill @ [
+            Sltu (t0, Zero, rs1);
+            Sltu (t1, Zero, rs2);
+            And (result_reg, t0, t1)
+          ] in
+          (instrs, [t0; t1])
+      | "||" ->
+          let t0, t0_spill = get_temp_reg ctx in
+          let instrs = t0_spill @ [
+            Or (t0, rs1, rs2);
+            Sltu (result_reg, Zero, t0)
+          ] in
+          (instrs, [t0])
+      | _ -> failwith (Printf.sprintf "Unknown binary operator: %s" op)
+    in
+    (* 释放临时寄存器 *)
+    let release_temp_instrs = 
+      List.concat_map (fun reg -> release_temp_reg ctx reg) temp_regs_used in
+    (* 释放操作数寄存器 *)
+    let release_e1_instrs = release_temp_reg ctx e1_reg in
+    let release_e2_instrs = release_temp_reg ctx e2_reg in
+    (* 组合所有指令 *)
+    let all_instrs = e1_instrs @ e2_instrs @ spill_instrs @ instrs @ 
+                     op_instrs @ release_temp_instrs @ release_e1_instrs @ release_e2_instrs in
+    result_reg, all_instrs
 
   | Ast.Call (fname, args) ->
     (* 优化：处理递归调用时减少寄存器压力 *)
@@ -608,15 +549,15 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * asm_item list =
                  | 4 -> A4 | 5 -> A5 | 6 -> A6 | 7 -> A7
                  | _ -> failwith "Invalid register index"
                in
-               arg_code @ [ Instruction (Mv (target_reg, arg_reg)) ]
+               arg_code @ [ Mv (target_reg, arg_reg) ]
              else
                (* 第9个及以后参数放在栈参数区(sp+0开始) *)
                let stack_arg_offset = ctx.stack_args_offset + ((i - 8) * 4) in
-               arg_code @ [ Instruction (Sw (arg_reg, Sp, stack_arg_offset)) ]  (* 使用Sp作为基地址 *)
+               arg_code @ [ Sw (arg_reg, Sp, stack_arg_offset) ]  (* 使用Sp作为基地址 *)
            in
            let release_instrs = 
              if is_recursive && i < 8 then []  (* 递归调用保留参数寄存器 *)
-             else release_temp_reg ctx arg_reg |> List.map (fun i -> Instruction i)
+             else release_temp_reg ctx arg_reg 
            in
            instrs @ release_instrs)
         args
@@ -629,13 +570,13 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * asm_item list =
     
     (* 3. 函数调用并由调用者将返回值(A0)保存到栈上 *)
     let call_instr = [ 
-      Instruction (Jal (Ra, fname)); 
-      Instruction (Sw (A0, Fp, result_offset));  (* 调用者保存结果到栈 *)
-      Instruction (Lw (result_reg, Fp, result_offset))  (* 从栈加载到结果寄存器 *)
+      Jal (Ra, fname); 
+      Sw (A0, Fp, result_offset);  (* 调用者保存结果到栈 *)
+      Lw (result_reg, Fp, result_offset)  (* 从栈加载到结果寄存器 *)
     ] in
     
     (* 4. 返回结果寄存器和完整指令序列 *)
-    result_reg, arg_instrs @ List.map (fun i -> Instruction i) spill_instrs @ call_instr   
+    result_reg, arg_instrs @ spill_instrs @ call_instr   
 
 (* 函数序言 - 分配栈帧并保存ra、fp和临时寄存器(T0-T6) *)
 let gen_prologue_instrs ctx frame_size =
@@ -667,9 +608,9 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
   | Ast.ExprStmt e ->
     let reg, instrs = gen_expr ctx e in
     (* 对于表达式语句，使用后释放寄存器但保留计算结果 *)
-    let release_instrs = release_temp_reg ctx reg |> List.map (fun i -> Instruction i) in
+    let release_instrs = release_temp_reg ctx reg in
     let all_instrs = instrs @ release_instrs in
-    all_instrs
+    List.map (fun i -> Instruction i) all_instrs
   
   | Ast.Block stmts ->
     let old_vars = ctx.local_vars in
@@ -698,10 +639,10 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
   | Ast.Return (Some e) ->
     let e_reg, e_instrs = gen_expr ctx e in
     (* 函数返回值放入A0 *)
-    let move_instr = [ Instruction (Mv (A0, e_reg)) ] in
-    let release_instrs = release_temp_reg ctx e_reg |> List.map (fun i -> Instruction i) in
-    let all_instrs = e_instrs @ move_instr @ release_instrs @ List.map (fun i -> Instruction i) (gen_epilogue_instrs ctx ctx.frame_size) in
-    all_instrs
+    let move_instr = [ Mv (A0, e_reg) ] in
+    let release_instrs = release_temp_reg ctx e_reg in
+    let all_instrs = e_instrs @ move_instr @ release_instrs @ gen_epilogue_instrs ctx ctx.frame_size in
+    List.map (fun i -> Instruction i) all_instrs
   
   | Ast.Return None -> 
     List.map (fun i -> Instruction i) 
@@ -713,15 +654,15 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let end_label = new_label ctx "endif" in
     let then_items = gen_stmt ctx then_stmt in
     let else_items = Option.value ~default:[] (Option.map (gen_stmt ctx) else_stmt) in
-    let release_instrs = release_temp_reg ctx cond_reg |> List.map (fun i -> Instruction i) in
+    let release_instrs = release_temp_reg ctx cond_reg in
     
-    cond_instrs
+    List.map (fun i -> Instruction i) cond_instrs
     @ [ Instruction (Beq (cond_reg, Zero, else_label)) ]
     @ then_items
     @ [ Instruction (J end_label); Label else_label ]
     @ else_items
     @ [ Label end_label ]
-    @ release_instrs
+    @ List.map (fun i -> Instruction i) release_instrs
   
   | Ast.While (cond, body) ->
     let loop_label = new_label ctx "loop" in
@@ -732,14 +673,14 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let body_items = gen_stmt ctx body in
     ctx.break_labels <- List.tl ctx.break_labels;
     ctx.continue_labels <- List.tl ctx.continue_labels;
-    let release_instrs = release_temp_reg ctx cond_reg |> List.map (fun i -> Instruction i) in
+    let release_instrs = release_temp_reg ctx cond_reg in
     
     [ Label loop_label ]
-    @ cond_instrs
+    @ List.map (fun i -> Instruction i) cond_instrs
     @ [ Instruction (Beq (cond_reg, Zero, end_label)) ]
     @ body_items
     @ [ Instruction (J loop_label); Label end_label ]
-    @ release_instrs
+    @ List.map (fun i -> Instruction i) release_instrs
   
   | Ast.Break ->
     (match ctx.break_labels with
@@ -755,19 +696,19 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let offset = add_local_var ctx name in  (* 分配到局部变量区 *)
     let e_reg, e_instrs = gen_expr ctx e in
     (* 将函数调用结果存储到变量中 *)
-    let store_instr = [ Instruction (Sw (e_reg, Fp, offset)) ] in
-    let release_instrs = release_temp_reg ctx e_reg |> List.map (fun i -> Instruction i) in
+    let store_instr = [ Sw (e_reg, Fp, offset) ] in
+    let release_instrs = release_temp_reg ctx e_reg in
     let all_instrs = e_instrs @ store_instr @ release_instrs in
-    all_instrs
+    List.map (fun i -> Instruction i) all_instrs
   
   | Ast.Assign (name, e) ->
     let offset = get_var_offset ctx name in
     let e_reg, e_instrs = gen_expr ctx e in
     (* 将函数调用结果赋值给变量 *)
-    let store_instr = [ Instruction (Sw (e_reg, Fp, offset)) ] in
-    let release_instrs = release_temp_reg ctx e_reg |> List.map (fun i -> Instruction i) in
+    let store_instr = [ Sw (e_reg, Fp, offset) ] in
+    let release_instrs = release_temp_reg ctx e_reg in
     let all_instrs = e_instrs @ store_instr @ release_instrs in
-    all_instrs
+    List.map (fun i -> Instruction i) all_instrs
 
 (* 栈帧大小计算 - 包含寄存器溢出区 *)
 let calculate_frame_size_and_offsets (func_def : Ast.func_def) =
@@ -889,12 +830,16 @@ let gen_program symbol_table (program : Ast.program) =
   @ List.flatten (List.map (gen_function symbol_table) program)
 
 
+
+
+
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
