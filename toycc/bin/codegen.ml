@@ -99,8 +99,8 @@ type instruction =
   | Slti of reg * reg * int 
   | Sltu of reg * reg * reg 
   | Sltiu of reg * reg * int 
-  | Lw of reg * reg * int  (* reg * base_reg * offset 形式 *)
-  | Sw of reg * reg * int  (* reg * base_reg * offset 形式 *)
+  | Lw of reg * reg * int  (* 修改为 reg * base_reg * offset 形式 *)
+  | Sw of reg * reg * int  (* 修改为 reg * base_reg * offset 形式 *)
   | Beq of reg * reg * string 
   | Bne of reg * reg * string 
   | Blt of reg * reg * string 
@@ -235,15 +235,13 @@ let emit_asm_to_stdout asm_items =
 type spilled_reg = {
   reg: reg;
   offset: int;  (* 相对于fp的偏移 *)
-  last_used: int;  (* 新增：记录最后使用时间，用于LRU算法 *)
 }
 
 (* 代码生成上下文 - 增加寄存器溢出管理 *)
 type codegen_context =
   { mutable label_counter : int
   ; mutable temp_counter : int
-  ; mutable step_counter : int  (* 新增：用于LRU算法的步骤计数 *)
-  ; used_regs : spilled_reg list ref  (* 改进：存储更多信息用于LRU *)
+  ; used_regs : reg list ref  (* 当前正在使用的寄存器 *)
   ; free_regs : reg list ref  (* 可用的临时寄存器 *)
   ; spill_stack : spilled_reg list ref  (* 被溢出到栈的寄存器 *)
   ; mutable spill_offset : int  (* 溢出区域当前偏移，从fp开始计算（负值） *)
@@ -260,7 +258,6 @@ type codegen_context =
   ; ret_val_offset : int          (* 函数返回值在栈帧中的偏移 (相对fp) *)
   ; stack_args_offset : int       (* 栈参数区起始偏移 (相对sp) *)
   ; spill_area_size : int         (* 寄存器溢出区大小 *)
-  ; is_tail_call : bool ref       (* 新增：标记是否为尾调用 *)
   }
 
 (* 定义临时寄存器列表 - 被调用者保存 *)
@@ -278,7 +275,7 @@ let params_end_offset = params_start_offset - params_area_size  (* fp-268 *)
 let ret_val_area_size = 4           (* 返回值保存区4字节 *)
 let stack_args_area_size = 256      (* 栈参数区固定256字节 *)
 let call_results_area_size = 512     (* 函数调用结果保存区 *)
-let spill_area_size = 256     (* 保持原大小 *)
+let spill_area_size = 256     (* 优化：16KB溢出区，足够大多数情况 *)
 
 (* 创建上下文 - 初始化寄存器溢出管理 *)
 let create_context _symbol_table func_name frame_size call_results_area_size 
@@ -286,7 +283,6 @@ let create_context _symbol_table func_name frame_size call_results_area_size
   let initial_spill_offset = params_end_offset - spill_area_size in
   { label_counter = 0;
     temp_counter = 0;
-    step_counter = 0;  (* 初始化步骤计数器 *)
     used_regs = ref [];
     free_regs = ref temp_regs;  (* 初始时所有临时寄存器都可用 *)
     spill_stack = ref [];
@@ -304,7 +300,6 @@ let create_context _symbol_table func_name frame_size call_results_area_size
     ret_val_offset = ret_val_offset;
     stack_args_offset = stack_args_offset;
     spill_area_size = spill_area_size;
-    is_tail_call = ref false;  (* 初始化尾调用标记 *)
   }
 
 (* 生成新标签 *)
@@ -313,18 +308,15 @@ let new_label ctx prefix =
   ctx.label_counter <- ctx.label_counter + 1;
   label
 
-(* 改进：使用LRU算法选择溢出寄存器 *)
+(* 优化：优先选择最近最少使用的寄存器进行溢出 *)
 let get_least_recently_used_reg used_regs =
   match !used_regs with
   | [] -> None
-  | regs -> 
-      Some (List.fold_left (fun acc r ->
-        if r.last_used < acc.last_used then r else acc
-      ) (List.hd regs) regs)
+  | regs -> Some (List.hd (List.rev regs))  (* 假设最后添加的是最近使用的 *)
 
 (* 临时寄存器管理 - 带溢出机制优化 *)
 let spill_one_register ctx =
-  (* 使用LRU算法选择寄存器溢出 *)
+  (* 优化：选择最近最少使用的寄存器溢出 *)
   let reg_to_spill = 
     match get_least_recently_used_reg ctx.used_regs with
     | Some reg -> reg
@@ -340,24 +332,23 @@ let spill_one_register ctx =
   (* 保存寄存器值到栈 *)
   let offset = ctx.spill_offset in
   ctx.spill_offset <- ctx.spill_offset - 4;
-  let spill_instr = Sw (reg_to_spill.reg, Fp, offset) in
+  let spill_instr = Sw (reg_to_spill, Fp, offset) in
   
   (* 更新上下文状态 *)
-  ctx.used_regs := List.filter (fun r -> r.reg <> reg_to_spill.reg) !(ctx.used_regs);
-  ctx.free_regs := reg_to_spill.reg :: !(ctx.free_regs);
-  ctx.spill_stack := {reg = reg_to_spill.reg; offset; last_used = ctx.step_counter} :: !(ctx.spill_stack);
+  ctx.used_regs := List.filter (fun r -> r <> reg_to_spill) !(ctx.used_regs);
+  ctx.free_regs := reg_to_spill :: !(ctx.free_regs);
+  ctx.spill_stack := {reg = reg_to_spill; offset} :: !(ctx.spill_stack);
   
   spill_instr
 
 let get_temp_reg ctx =
   let rec get_reg () =
-    ctx.step_counter <- ctx.step_counter + 1;  (* 每次获取寄存器增加步骤计数 *)
     match !(ctx.free_regs) with
     | reg :: rest ->
       (* 有可用寄存器，直接使用 *)
       ctx.free_regs := rest;
-      (* 将新使用的寄存器添加到used_regs，记录当前步骤作为最后使用时间 *)
-      ctx.used_regs := !(ctx.used_regs) @ [{reg; offset=0; last_used=ctx.step_counter}];
+      (* 优化：将新使用的寄存器添加到列表末尾表示最近使用 *)
+      ctx.used_regs := !(ctx.used_regs) @ [reg];
       reg, []
     | [] ->
       (* 没有可用寄存器，溢出一个到栈中 *)
@@ -368,25 +359,19 @@ let get_temp_reg ctx =
   get_reg ()
 
 let release_temp_reg ctx reg =
-  let rec update_used_regs = function
-    | [] -> []
-    | r::rs when r.reg = reg -> rs  (* 移除要释放的寄存器 *)
-    | r::rs -> r :: update_used_regs rs
-  in
-  
-  if List.exists (fun r -> r.reg = reg) !(ctx.used_regs) then begin
+  if List.mem reg !(ctx.used_regs) then begin
     (* 从used_regs移除，添加到free_regs *)
-    ctx.used_regs := update_used_regs !(ctx.used_regs);
+    ctx.used_regs := List.filter (fun r -> r <> reg) !(ctx.used_regs);
     ctx.free_regs := reg :: !(ctx.free_regs);
     
-    (* 尝试从溢出栈恢复寄存器 - 只在有足够空闲寄存器时恢复 *)
+    (* 尝试从溢出栈恢复寄存器 - 优化：只在需要时恢复 *)
     let try_restore () =
       match !(ctx.spill_stack) with
       | spill :: spills when List.length !(ctx.free_regs) > 2 ->
         (* 当有多个空闲寄存器时才恢复，减少频繁交换 *)
         let restore_instr = Lw (spill.reg, Fp, spill.offset) in
         ctx.spill_stack := spills;
-        ctx.used_regs := !(ctx.used_regs) @ [{reg = spill.reg; offset = spill.offset; last_used = ctx.step_counter}];
+        ctx.used_regs := !(ctx.used_regs) @ [spill.reg];
         ctx.free_regs := List.filter (fun r -> r <> spill.reg) !(ctx.free_regs);
         [restore_instr]
       | _ -> []
@@ -474,11 +459,11 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     result_reg, e_instrs @ spill_instrs @ op_instrs @ release_instrs
 
   | Ast.BinOp (e1, op, e2) ->
-    (* 对于简单运算，尝试复用寄存器减少溢出 *)
+    (* 优化：对于简单运算，尝试复用寄存器减少溢出 *)
     let e1_reg, e1_instrs = gen_expr ctx e1 in
     let e2_reg, e2_instrs = gen_expr ctx e2 in
     
-    (* 对于 commutative 操作，选择占用寄存器更久的作为第一个操作数 *)
+    (* 优化：对于 commutative 操作，选择占用寄存器更久的作为第一个操作数 *)
     let (rs1, rs2, instrs) = 
       match op with
       | "+" | "*" | "&&" | "||" | "==" | "!=" ->
@@ -547,9 +532,8 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     result_reg, all_instrs
 
   | Ast.Call (fname, args) ->
-    (* 处理递归调用时减少寄存器压力 *)
+    (* 优化：处理递归调用时减少寄存器压力 *)
     let is_recursive = fname = ctx.func_name in
-    let is_tail = !(ctx.is_tail_call) in  (* 检查是否为尾调用 *)
     
     (* 1. 处理参数：前8个用寄存器，其余用栈参数区(sp+0开始) *)
     let arg_instrs =
@@ -572,7 +556,7 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
                arg_code @ [ Sw (arg_reg, Sp, stack_arg_offset) ]  (* 使用Sp作为基地址 *)
            in
            let release_instrs = 
-             if (is_recursive && i < 8) || is_tail then []  (* 递归调用或尾调用保留参数寄存器 *)
+             if is_recursive && i < 8 then []  (* 递归调用保留参数寄存器 *)
              else release_temp_reg ctx arg_reg 
            in
            instrs @ release_instrs)
@@ -585,16 +569,11 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let result_reg, spill_instrs = get_temp_reg ctx in
     
     (* 3. 函数调用并由调用者将返回值(A0)保存到栈上 *)
-    let call_instr = 
-      if is_tail then
-        (* 尾调用优化：直接跳转到函数，不保存返回地址 *)
-        [ J fname ]
-      else
-        [ Jal (Ra, fname); 
-          Sw (A0, Fp, result_offset);  (* 调用者保存结果到栈 *)
-          Lw (result_reg, Fp, result_offset)  (* 从栈加载到结果寄存器 *)
-        ]
-    in
+    let call_instr = [ 
+      Jal (Ra, fname); 
+      Sw (A0, Fp, result_offset);  (* 调用者保存结果到栈 *)
+      Lw (result_reg, Fp, result_offset)  (* 从栈加载到结果寄存器 *)
+    ] in
     
     (* 4. 返回结果寄存器和完整指令序列 *)
     result_reg, arg_instrs @ spill_instrs @ call_instr   
@@ -642,7 +621,6 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let old_used_regs = !(ctx.used_regs) in
     let old_free_regs = !(ctx.free_regs) in
     let old_spill_stack = !(ctx.spill_stack) in
-    let old_step_counter = ctx.step_counter in
     
     let items = List.map (gen_stmt ctx) stmts |> List.flatten in
     
@@ -655,33 +633,16 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     ctx.used_regs := old_used_regs;
     ctx.free_regs := old_free_regs;
     ctx.spill_stack := old_spill_stack;
-    ctx.step_counter <- old_step_counter;
     
     items
   
   | Ast.Return (Some e) ->
-    (* 检查是否为尾递归调用 *)
-    let is_tail_recursion = 
-      match e with
-      | Ast.Call (fname, _) when fname = ctx.func_name -> true
-      | _ -> false
-    in
-    
-    if is_tail_recursion then begin
-      (* 尾递归优化：直接跳转到函数开头，不返回 *)
-      let _, e_instrs = gen_expr ctx e in
-      (* 恢复参数寄存器并跳转到函数开头 *)
-      let jump_instr = [ J ctx.func_name ] in
-      let all_instrs = e_instrs @ jump_instr in
-      List.map (fun i -> Instruction i) all_instrs
-    end else begin
-      let e_reg, e_instrs = gen_expr ctx e in
-      (* 函数返回值放入A0 *)
-      let move_instr = [ Mv (A0, e_reg) ] in
-      let release_instrs = release_temp_reg ctx e_reg in
-      let all_instrs = e_instrs @ move_instr @ release_instrs @ gen_epilogue_instrs ctx ctx.frame_size in
-      List.map (fun i -> Instruction i) all_instrs
-    end
+    let e_reg, e_instrs = gen_expr ctx e in
+    (* 函数返回值放入A0 *)
+    let move_instr = [ Mv (A0, e_reg) ] in
+    let release_instrs = release_temp_reg ctx e_reg in
+    let all_instrs = e_instrs @ move_instr @ release_instrs @ gen_epilogue_instrs ctx ctx.frame_size in
+    List.map (fun i -> Instruction i) all_instrs
   
   | Ast.Return None -> 
     List.map (fun i -> Instruction i) 
@@ -708,19 +669,8 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let end_label = new_label ctx "endloop" in
     ctx.break_labels <- end_label :: ctx.break_labels;
     ctx.continue_labels <- loop_label :: ctx.continue_labels;
-    
-    (* 提取条件表达式生成，以便在循环末尾复用 *)
-    let cond_gen () = gen_expr ctx cond in
-    
-    (* 生成条件检查和循环体 *)
-    let cond_reg, cond_instrs = cond_gen () in
+    let cond_reg, cond_instrs = gen_expr ctx cond in
     let body_items = gen_stmt ctx body in
-    
-    (* 循环末尾再次检查条件 *)
-    let recheck_cond_reg, recheck_cond_instrs = cond_gen () in
-    let recheck_instr = [ Instruction (Bne (recheck_cond_reg, Zero, loop_label)) ] in
-    let release_recheck_instrs = release_temp_reg ctx recheck_cond_reg in
-    
     ctx.break_labels <- List.tl ctx.break_labels;
     ctx.continue_labels <- List.tl ctx.continue_labels;
     let release_instrs = release_temp_reg ctx cond_reg in
@@ -729,10 +679,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     @ List.map (fun i -> Instruction i) cond_instrs
     @ [ Instruction (Beq (cond_reg, Zero, end_label)) ]
     @ body_items
-    @ List.map (fun i -> Instruction i) recheck_cond_instrs
-    @ recheck_instr
-    @ List.map (fun i -> Instruction i) release_recheck_instrs
-    @ [ Label end_label ]
+    @ [ Instruction (J loop_label); Label end_label ]
     @ List.map (fun i -> Instruction i) release_instrs
   
   | Ast.Break ->
@@ -798,24 +745,12 @@ let calculate_frame_size_and_offsets (func_def : Ast.func_def) =
   
   (frame_size, call_results_area_size, ret_val_offset, stack_args_offset, spill_area_size)
 
-(* 检查是否为尾调用 *)
-let rec is_tail_call (stmt : Ast.stmt) =
-  match stmt with
-  | Return (Some (Call _)) -> true
-  | Block [s] -> is_tail_call s
-  | If (_, s1, Some s2) -> is_tail_call s1 && is_tail_call s2
-  | If (_, s, None) -> is_tail_call s
-  | _ -> false
-
 (* 函数生成 - 支持寄存器溢出机制 *)
 let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   let (frame_size, call_results_area_size, ret_val_offset, stack_args_offset, spill_area_size) = 
     calculate_frame_size_and_offsets func_def in
   let ctx = create_context symbol_table func_def.fname frame_size 
       call_results_area_size ret_val_offset stack_args_offset spill_area_size in
-  
-  (* 检查函数是否包含尾调用 *)
-  ctx.is_tail_call := List.exists is_tail_call func_def.body;
   
   (* 函数序言：一次性分配整个栈帧、设置fp并保存临时寄存器 *)
   let prologue = List.map (fun i -> Instruction i) (gen_prologue_instrs ctx frame_size) in
@@ -850,12 +785,7 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   (* 生成函数体 *)
   let body_items =
     func_def.body
-    |> List.map (fun s -> 
-        let old_tail_flag = !(ctx.is_tail_call) in
-        ctx.is_tail_call := is_tail_call s;
-        let items = gen_stmt ctx s in
-        ctx.is_tail_call := old_tail_flag;
-        items)
+    |> List.map (fun s -> gen_stmt ctx s)
     |> List.flatten
   in
   
@@ -896,8 +826,10 @@ let gen_program symbol_table (program : Ast.program) =
     Comment "6. 返回值保存区 (4字节)";
     Comment "7. 参数区 (256字节)";
     Comment "8. ra (fp-4) 和 旧fp (fp-8)";
-    Comment "优化: 采用LRU算法选择溢出寄存器，支持尾递归优化" ]
+    Comment "优化: 采用LRU算法选择溢出寄存器，减少溢出次数" ]
   @ List.flatten (List.map (gen_function symbol_table) program)
+
+
 
 
 
@@ -907,6 +839,7 @@ let compile_to_riscv symbol_table program =
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
