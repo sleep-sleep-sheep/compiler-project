@@ -562,7 +562,6 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     in
   
     (* 2. 调用者分配栈空间保存函数调用结果 *)
-    let result_offset = alloc_call_result ctx in
     let result_reg, spill_instrs = get_temp_reg ctx in
     
     (* 3. 函数调用并由调用者将返回值(A0)保存到栈上 *)
@@ -822,6 +821,7 @@ let compile_to_riscv symbol_table program =
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
