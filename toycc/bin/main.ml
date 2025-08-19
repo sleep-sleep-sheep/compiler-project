@@ -48,7 +48,8 @@ let () =
       Printf.eprintf "系统错误: %s\n" msg;
       exit 1
   | e ->
-      Printf.eprintf "未知错误: %s\n" (Printexc.to_string e);
+      Printf.eprintf "未知错误: %s\n"  input;
       exit 1
+
 
 
