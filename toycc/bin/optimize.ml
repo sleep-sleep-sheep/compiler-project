@@ -26,6 +26,12 @@ let rec fold_constants_expr expr =
             | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
           in
           Literal (IntLit result)
+      (* 部分折叠优化 *)
+      | e, Literal (IntLit 0) when op = "+" -> e  (* x + 0 → x *)
+      | Literal (IntLit 0), e when op = "+" -> e  (* 0 + x → x *)
+      | e, Literal (IntLit 0) when op = "-" -> e  (* x - 0 → x *)
+      | Literal (IntLit 1), e when op = "*" -> e  (* 1 * x → x *)
+      | e, Literal (IntLit 1) when op = "*" -> e  (* x * 1 → x *)
       | _ -> BinOp (e1', op, e2')
       end
   | UnOp (op, e) ->
@@ -38,6 +44,7 @@ let rec fold_constants_expr expr =
             | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
           in
           Literal (IntLit result)
+      | UnOp ("!", e'') -> e''  (* !!x → x *)
       | _ -> UnOp (op, e')
       end
   | Call (fname, args) ->
@@ -78,7 +85,7 @@ let fold_constants program =
   ) program
 
 
-(* 常量传播优化 *)
+(* 简化版常量传播：只处理顶级常量，不迭代，不合并环境 *)
 type var_status =
   | Const of literal  (* 变量持有常量值 *)
   | Top               (* 变量值未知或不可预测 *)
@@ -86,189 +93,68 @@ type var_status =
 module VarEnv = Map.Make(String)
 type env = var_status VarEnv.t
 
-let init_env : env = VarEnv.empty
+(* 仅收集顶级常量（声明或赋值时直接初始化的常量） *)
+let collect_top_level_constants stmts =
+  List.fold_left (fun env stmt ->
+    match stmt with
+    | Decl (id, Literal lit) -> 
+        VarEnv.add id (Const lit) env  (* 收集声明时初始化的常量 *)
+    | Assign (id, Literal lit) -> 
+        VarEnv.add id (Const lit) env  (* 收集直接赋值的常量 *)
+    | _ -> env  (* 忽略其他语句 *)
+  ) VarEnv.empty stmts
 
-let is_constant_expr expr =
+(* 仅替换已知的顶级常量，不处理复杂表达式 *)
+let rec replace_top_level_vars env expr =
   match expr with
-  | Literal _ -> true
-  | _ -> false
-
-let expr_to_const (env : env) expr : var_status option =
-  match expr with
-  | Literal lit -> Some (Const lit)
-  | Var id -> VarEnv.find_opt id env
-  | _ -> None
-
-let rec analyze_stmt (env : env) stmt : env =
-  match stmt with
-  | Empty | Break | Continue | Return _ -> env
-  | ExprStmt _ -> env
-  | Assign (id, expr) ->
-      if is_constant_expr expr then
-        begin match expr with
-        | Literal lit -> VarEnv.add id (Const lit) env
-        | _ -> VarEnv.add id Top env
-        end
-      else
-        begin match expr_to_const env expr with
-        | Some const_val -> VarEnv.add id const_val env
-        | None -> VarEnv.add id Top env
-        end
-  | Decl (id, expr) ->
-      if is_constant_expr expr then
-        begin match expr with
-        | Literal lit -> VarEnv.add id (Const lit) env
-        | _ -> VarEnv.add id Top env
-        end
-      else
-        begin match expr_to_const env expr with
-        | Some const_val -> VarEnv.add id const_val env
-        | None -> VarEnv.add id Top env
-        end
-  | If (_, then_stmt, else_stmt_opt) ->
-      let then_env = analyze_stmt env then_stmt in
-      let else_env = 
-        match else_stmt_opt with
-        | Some else_stmt -> analyze_stmt env else_stmt
-        | None -> env
-      in
-      VarEnv.merge (fun _ v1 v2 ->
-        match v1, v2 with
-        | Some (Const l1), Some (Const l2) when l1 = l2 -> Some (Const l1)
-        | _ -> Some Top
-      ) then_env else_env
-  | While (_, _) ->
-      VarEnv.map (fun _ -> Top) env
-  | Block stmts ->
-      List.fold_left analyze_stmt env stmts
-
-let rec replace_vars_in_expr (env : env) expr =
-  match expr with
-  | Literal _ -> expr
   | Var id ->
       begin match VarEnv.find_opt id env with
-      | Some (Const lit) -> Literal lit
-      | _ -> expr
+      | Some (Const lit) -> Literal lit  (* 替换常量变量 *)
+      | _ -> expr  (* 非常量变量不替换 *)
       end
   | BinOp (e1, op, e2) ->
-      let e1' = replace_vars_in_expr env e1 in
-      let e2' = replace_vars_in_expr env e2 in
-      begin match e1', e2' with
-      | Literal (IntLit n1), Literal (IntLit n2) ->
-          let result = match op with
-            | "+" -> n1 + n2
-            | "-" -> n1 - n2
-            | "*" -> n1 * n2
-            | "/" -> n1 / n2
-            | "%" -> n1 mod n2
-            (* 比较运算符支持 *)
-            | "<" -> if n1 < n2 then 1 else 0
-            | ">" -> if n1 > n2 then 1 else 0
-            | "<=" -> if n1 <= n2 then 1 else 0
-            | ">=" -> if n1 >= n2 then 1 else 0
-            | "==" -> if n1 = n2 then 1 else 0
-            | "!=" -> if n1 != n2 then 1 else 0
-            | _ -> failwith ("Unsupported operator: " ^ op)
-          in
-          Literal (IntLit result)
-      | _ -> BinOp (e1', op, e2')
-      end
+      BinOp (replace_top_level_vars env e1, op, replace_top_level_vars env e2)
   | UnOp (op, e) ->
-      let e' = replace_vars_in_expr env e in
-      begin match e' with
-      | Literal (IntLit n) ->
-          let result = match op with
-            | "-" -> -n
-            | "!" -> if n = 0 then 1 else 0
-            | _ -> failwith ("Unsupported operator: " ^ op)
-          in
-          Literal (IntLit result)
-      | _ -> UnOp (op, e')
-      end
+      UnOp (op, replace_top_level_vars env e)
   | Call (fname, args) ->
-      Call (fname, List.map (replace_vars_in_expr env) args)
+      Call (fname, List.map (replace_top_level_vars env) args)
   | Paren e ->
-      Paren (replace_vars_in_expr env e)
+      Paren (replace_top_level_vars env e)
+  | Literal _ -> expr  (* 常量不处理 *)
 
-let rec propagate_in_stmt (env : env) stmt =
+(* 在语句中应用简化的常量传播 *)
+let rec propagate_in_stmt env stmt =
   match stmt with
   | Block stmts ->
-      let stmts', _ = propagate_in_stmts env stmts in
-      Block stmts'
+      Block (List.map (propagate_in_stmt env) stmts)
   | Empty -> Empty
   | ExprStmt expr ->
-      ExprStmt (replace_vars_in_expr env expr)
+      ExprStmt (replace_top_level_vars env expr)
   | Assign (id, expr) ->
-      Assign (id, replace_vars_in_expr env expr)
+      Assign (id, replace_top_level_vars env expr)
   | Decl (id, expr) ->
-      Decl (id, replace_vars_in_expr env expr)
+      Decl (id, replace_top_level_vars env expr)
   | If (cond, then_stmt, else_stmt_opt) ->
-      let cond' = replace_vars_in_expr env cond in
-      if is_constant_expr cond' then
-        match cond' with
-        | Literal (IntLit 0) ->  (* 条件为假 *)
-            begin match else_stmt_opt with
-            | Some else_stmt ->
-                let else_env = analyze_stmt env else_stmt in
-                propagate_in_stmt else_env else_stmt
-            | None -> Empty
-            end
-        | _ ->  (* 条件为真 *)
-            let then_env = analyze_stmt env then_stmt in
-            propagate_in_stmt then_env then_stmt
-      else
-        let then_env = analyze_stmt env then_stmt in
-        let then_stmt' = propagate_in_stmt then_env then_stmt in
-        let else_stmt_opt' = 
-          match else_stmt_opt with
-          | Some else_stmt ->
-              let else_env = analyze_stmt env else_stmt in
-              Some (propagate_in_stmt else_env else_stmt)
-          | None -> None
-        in
-        If (cond', then_stmt', else_stmt_opt')
+      let cond' = replace_top_level_vars env cond in
+      If (cond', propagate_in_stmt env then_stmt, 
+          Option.map (propagate_in_stmt env) else_stmt_opt)
   | While (cond, body) ->
-      let cond' = replace_vars_in_expr env cond in
-      if is_constant_expr cond' then
-        match cond' with
-        | Literal (IntLit 0) -> Empty  (* 条件恒为假，消除循环 *)
-        | _ -> 
-            let body' = propagate_in_stmt env body in
-            While (cond', body')
-      else
-        let body' = propagate_in_stmt env body in
-        While (cond', body')
+      While (replace_top_level_vars env cond, propagate_in_stmt env body)
   | Break -> Break
   | Continue -> Continue
   | Return expr_opt ->
-      Return (Option.map (replace_vars_in_expr env) expr_opt)
+      Return (Option.map (replace_top_level_vars env) expr_opt)
 
-and propagate_in_stmts env stmts =
-  List.fold_left (fun (stmts_acc, env_acc) stmt ->
-    let stmt' = propagate_in_stmt env_acc stmt in
-    let new_env = analyze_stmt env_acc stmt' in
-    (stmt' :: stmts_acc, new_env)
-  ) ([], env) stmts
-  |> fun (stmts', _) -> (List.rev stmts', env)
-
-let propagate_constants ?(max_iter=3) program =
-  let rec propagate_iter program iter =
-    if iter >= max_iter then program
-    else
-      let new_program = 
-        List.map (fun func ->
-          let env = init_env in
-          let body', _ = propagate_in_stmts env func.body in
-          { func with body = body' }
-        ) program
-      in
-      if new_program = program then new_program
-      else propagate_iter new_program (iter + 1)
-  in
-  propagate_iter program 0
+(* 简化版常量传播入口 *)
+let propagate_constants program =
+  List.map (fun func ->
+    let top_env = collect_top_level_constants func.body in  (* 只收集顶级常量 *)
+    let body' = List.map (propagate_in_stmt top_env) func.body in
+    { func with body = body' }
+  ) program
 
 
-(* 死代码消除 *)
+(* 强化版死代码消除 *)
 module VarSet = Set.Make(String)
 
 let is_const_true expr =
@@ -281,6 +167,7 @@ let is_const_false expr =
   | Literal (IntLit 0) -> true
   | _ -> false
 
+(* 移除不可达语句（增加深度处理） *)
 let rec eliminate_dead_stmt reachable stmt =
   if not reachable then (None, false)
   else
@@ -340,6 +227,7 @@ and eliminate_dead_stmts reachable stmts =
       in
       (stmts', rest_reachable)
 
+(* 收集所有被使用的变量 *)
 let rec collect_vars_expr vars expr =
   match expr with
   | Literal _ -> vars
@@ -377,6 +265,7 @@ let rec collect_vars_stmt vars stmt =
       | None -> vars
       end
 
+(* 移除未使用的变量 *)
 let rec remove_unused_stmt used_vars stmt =
   match stmt with
   | Block stmts ->
@@ -425,6 +314,7 @@ and remove_unused_expr used_vars expr =
   | Paren e ->
       Paren (remove_unused_expr used_vars e)
 
+(* 简化空语句和空块 *)
 let rec simplify_empty_stmt stmt =
   match stmt with
   | Block stmts ->
@@ -447,27 +337,30 @@ let rec simplify_empty_stmt stmt =
       While (cond, body')
   | _ -> stmt
 
+(* 强化版死代码消除入口 *)
 let eliminate_dead_code program =
   List.map (fun func ->
+    (* 1. 第一次消除不可达语句 *)
     let body_reachable, _ = eliminate_dead_stmts true func.body in
-    let used_vars = List.fold_left collect_vars_stmt VarSet.empty body_reachable in
-    let body_unused_removed = List.map (remove_unused_stmt used_vars) body_reachable in
+    (* 2. 第二次深度消除（处理嵌套块） *)
+    let body_deep_reachable = 
+      List.map (fun s -> 
+        let s', _ = eliminate_dead_stmt true s in
+        Option.value s' ~default:Empty
+      ) body_reachable
+    in
+    (* 3. 收集使用的变量 *)
+    let used_vars = List.fold_left collect_vars_stmt VarSet.empty body_deep_reachable in
+    (* 4. 移除未使用的变量 *)
+    let body_unused_removed = List.map (remove_unused_stmt used_vars) body_deep_reachable in
+    (* 5. 简化空语句 *)
     let body_simplified = List.map simplify_empty_stmt body_unused_removed in
     { func with body = body_simplified }
   ) program
 
 (* 完整的优化流程 *)
 let optimize program =
-  let rec optimize_iter program iter =
-    if iter >= 3 then program
-    else
-      let optimized = 
-        program 
-        |> fold_constants
-        |> propagate_constants
-        |> eliminate_dead_code
-      in
-      if optimized = program then optimized
-      else optimize_iter optimized (iter + 1)
-  in
-  optimize_iter program 0
+  program 
+  |> fold_constants        (* 强化的常量折叠 *)
+  |> propagate_constants   (* 简化的常量传播 *)
+  |> eliminate_dead_code   (* 强化的死代码消除 *)
