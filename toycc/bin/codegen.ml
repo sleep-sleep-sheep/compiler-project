@@ -815,12 +815,13 @@ let gen_program symbol_table (program : Ast.program) =
 
 
 
-let compile_to_riscv symbol_table program =
+let compile_to_riscv1 symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
