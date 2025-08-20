@@ -1,213 +1,16 @@
 open Ast
 
 (*****************************************************************************)
-(* 尾递归优化 (TCO)                                                         *)
+(* 共享的工具函数                                                           *)
 (*****************************************************************************)
+
+module VarSet = Set.Make(String)
 
 (* 获取列表的最后一个元素和前面的元素 *)
 let rec last_and_init = function
   | [] -> failwith "Internal error: last_and_init called on an empty list"
   | [x] -> (x, [])
   | h :: t -> let (last, init) = last_and_init t in (last, h :: init)
-
-(* 扫描语句，检查是否包含尾递归调用 *)
-let rec contains_tco_candidate (func: func_def) (is_tail_pos: bool) (stmt: stmt) : bool =
-  match stmt with
-  | Return (Some (Call(callee, args))) ->
-      (* 如果在尾位置，且调用自身，参数数量匹配，则是尾递归候选 *)
-      is_tail_pos && callee = func.fname && List.length args = List.length func.params
-  
-  | If (_, then_s, else_s_opt) ->
-      (* 检查if语句的两个分支 *)
-      let then_has = contains_tco_candidate func is_tail_pos then_s in
-      let else_has = match else_s_opt with
-        | Some else_s -> contains_tco_candidate func is_tail_pos else_s
-        | None -> false
-      in
-      then_has || else_has
-
-  | Block (stmts) ->
-      if not is_tail_pos || stmts = [] then
-        (* 非尾位置，检查任何语句是否有尾递归 *)
-        List.exists (contains_tco_candidate func false) stmts
-      else
-        (* 尾位置，只有最后一个语句可能是尾递归 *)
-        let (last, init) = last_and_init stmts in
-        List.exists (contains_tco_candidate func false) init || 
-        contains_tco_candidate func true last
-
-  | While (_, body) -> 
-      (* while循环体中没有尾位置 *)
-      contains_tco_candidate func false body
-  
-  | _ -> false
-
-(* 转换语句，将尾递归调用转换为赋值和continue *)
-let rec transform_stmt_for_tco (func: func_def) (is_tail_pos: bool) (fresh_var_gen: unit -> id) (stmt: stmt) : stmt =
-  match stmt with
-  | Return (Some (Call(callee, args))) 
-    when is_tail_pos && callee = func.fname && List.length args = List.length func.params ->
-      (* 处理尾递归调用：将参数存储到临时变量，赋值给函数参数，然后continue *)
-      let params = func.params in
-      let temp_decls_and_names = List.map (fun arg_expr ->
-        let temp_name = fresh_var_gen () in
-        (temp_name, Decl(temp_name, arg_expr))
-      ) args in
-      let temp_decls = List.map snd temp_decls_and_names in
-      let temp_names = List.map fst temp_decls_and_names in
-      let assignments = List.map2 (fun param temp_name ->
-        Assign(param.pname, Var temp_name)
-      ) params temp_names in
-      Block(temp_decls @ assignments @ [Continue])
-
-  | If (cond, then_s, else_s_opt) ->
-      (* 转换if语句的两个分支 *)
-      let new_then = transform_stmt_for_tco func is_tail_pos fresh_var_gen then_s in
-      let new_else_opt = Option.map (transform_stmt_for_tco func is_tail_pos fresh_var_gen) else_s_opt in
-      If (cond, new_then, new_else_opt)
-
-  | Block (stmts) ->
-      if not is_tail_pos || stmts = [] then
-        (* 非尾位置，转换所有语句 *)
-        Block (List.map (transform_stmt_for_tco func false fresh_var_gen) stmts)
-      else
-        (* 尾位置，只将最后一个语句视为尾位置 *)
-        let (last, init) = last_and_init stmts in
-        let transformed_init = List.map (transform_stmt_for_tco func false fresh_var_gen) init in
-        let transformed_last = transform_stmt_for_tco func true fresh_var_gen last in
-        Block(transformed_init @ [transformed_last])
-        
-  | While (cond, body) ->
-      (* 转换while循环体 *)
-      While(cond, transform_stmt_for_tco func false fresh_var_gen body)
-
-  | _ -> stmt
-
-(* 单个函数的尾递归优化 *)
-let optimize_func_for_tco (func: func_def) : func_def =
-  (* 检查函数是否有尾递归调用 *)
-  let has_tco_candidate = List.exists (contains_tco_candidate func true) func.body in
-  
-  if not has_tco_candidate then
-    func  (* 没有尾递归，直接返回 *)
-  else
-    (* 生成新的变量名 *)
-    let counter = ref 0 in
-    let fresh_var_gen () =
-      counter := !counter + 1;
-      "__tco_" ^ func.fname ^ "_" ^ (string_of_int !counter)
-    in
-    (* 转换函数体中的语句 *)
-    let transformed_body_stmts = List.map (transform_stmt_for_tco func true fresh_var_gen) func.body in
-    (* 创建一个无限循环包裹转换后的代码 *)
-    let true_expr = Literal (IntLit 1) in  (* 非0值表示真 *)
-    let loop_body = Block transformed_body_stmts in
-    let new_body = [While (true_expr, loop_body)] in
-    { func with body = new_body }
-
-(* 尾递归优化入口函数 *)
-let optimize_tail_recursion (prog: program) : program =
-  List.map optimize_func_for_tco prog
-
-(*****************************************************************************)
-(* 强化版常量折叠优化                                                       *)
-(*****************************************************************************)
-
-let rec fold_constants_expr expr =
-  match expr with
-  | Literal _ -> expr
-  | Var _ -> expr
-  | BinOp (e1, op, e2) ->
-      let e1' = fold_constants_expr e1 in
-      let e2' = fold_constants_expr e2 in
-      begin match e1', e2' with
-      | Literal (IntLit n1), Literal (IntLit n2) ->
-          let result = match op with
-            | "+" -> n1 + n2
-            | "-" -> n1 - n2
-            | "*" -> n1 * n2
-            | "/" -> n1 / n2
-            | "%" -> n1 mod n2
-            (* 比较运算符支持 *)
-            | "<" -> if n1 < n2 then 1 else 0
-            | ">" -> if n1 > n2 then 1 else 0
-            | "<=" -> if n1 <= n2 then 1 else 0
-            | ">=" -> if n1 >= n2 then 1 else 0
-            | "==" -> if n1 = n2 then 1 else 0
-            | "!=" -> if n1 != n2 then 1 else 0
-            | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
-          in
-          Literal (IntLit result)
-      (* 扩展部分折叠规则集 *)
-      | e, Literal (IntLit 0) when op = "+" -> e  (* x + 0 → x *)
-      | Literal (IntLit 0), e when op = "+" -> e  (* 0 + x → x *)
-      | e, Literal (IntLit 0) when op = "-" -> e  (* x - 0 → x *)
-      | Literal (IntLit 0), e when op = "-" -> UnOp ("-", e)  (* 0 - x → -x *)
-      | Literal (IntLit 1), e when op = "*" -> e  (* 1 * x → x *)
-      | e, Literal (IntLit 1) when op = "*" -> e  (* x * 1 → x *)
-      | _, Literal (IntLit 0) when op = "*" -> Literal (IntLit 0)  (* x * 0 → 0 *)
-      | Literal (IntLit 0), _ when op = "*" -> Literal (IntLit 0)  (* 0 * x → 0 *)
-      | _ -> BinOp (e1', op, e2')
-      end
-  | UnOp (op, e) ->
-      let e' = fold_constants_expr e in
-      begin match e' with
-      | Literal (IntLit n) ->
-          let result = match op with
-            | "-" -> -n
-            | "!" -> if n = 0 then 1 else 0
-            | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
-          in
-          Literal (IntLit result)
-      | UnOp ("!", e'') -> e''  (* !!x → x *)
-      | UnOp ("-", UnOp ("-", e'')) -> e''  (* -(-x) → x *)
-      | _ -> UnOp (op, e')
-      end
-  | Call (fname, args) ->
-      let args' = List.map fold_constants_expr args in
-      Call (fname, args')
-  | Paren e ->
-      let e' = fold_constants_expr e in
-      begin match e' with
-      | Paren e'' -> e''  (* 移除嵌套括号 ((x)) → x *)
-      | _ -> Paren e'
-      end
-
-let rec fold_constants_stmt stmt =
-  match stmt with
-  | Block stmts ->
-      Block (List.map fold_constants_stmt stmts)
-  | Empty -> Empty
-  | ExprStmt expr ->
-      ExprStmt (fold_constants_expr expr)
-  | Assign (id, expr) ->
-      Assign (id, fold_constants_expr expr)
-  | Decl (id, expr) ->
-      Decl (id, fold_constants_expr expr)
-  | If (cond, then_stmt, else_stmt_opt) ->
-      let cond' = fold_constants_expr cond in
-      let then_stmt' = fold_constants_stmt then_stmt in
-      let else_stmt_opt' = Option.map fold_constants_stmt else_stmt_opt in
-      If (cond', then_stmt', else_stmt_opt')
-  | While (cond, body) ->
-      let cond' = fold_constants_expr cond in
-      let body' = fold_constants_stmt body in
-      While (cond', body')
-  | Break -> Break
-  | Continue -> Continue
-  | Return expr_opt ->
-      Return (Option.map fold_constants_expr expr_opt)
-
-let fold_constants program =
-  List.map (fun func ->
-    { func with body = List.map fold_constants_stmt func.body }
-  ) program
-
-(*****************************************************************************)
-(* 循环优化：循环不变量外提                                                   *)
-(*****************************************************************************)
-
-module VarSet = Set.Make(String)
 
 (* 收集表达式中使用的变量 *)
 let rec expr_vars expr =
@@ -234,12 +37,188 @@ let rec stmt_defs stmt =
   | While (_, body) -> stmt_defs body
   | _ -> VarSet.empty  (* 其他语句不定义变量 *)
 
-(* 检查表达式是否是循环不变量 *)
+(*****************************************************************************)
+(* 尾递归优化 (TCO)                                                         *)
+(*****************************************************************************)
+
+(* 扫描语句，检查是否包含尾递归调用 *)
+let rec contains_tco_candidate (func: func_def) (is_tail_pos: bool) (stmt: stmt) : bool =
+  match stmt with
+  | Return (Some (Call(callee, args))) ->
+      is_tail_pos && callee = func.fname && List.length args = List.length func.params
+  
+  | If (_, then_s, else_s_opt) ->
+      let then_has = contains_tco_candidate func is_tail_pos then_s in
+      let else_has = match else_s_opt with
+        | Some else_s -> contains_tco_candidate func is_tail_pos else_s
+        | None -> false
+      in
+      then_has || else_has
+
+  | Block (stmts) ->
+      if not is_tail_pos || stmts = [] then
+        List.exists (contains_tco_candidate func false) stmts
+      else
+        let (last, init) = last_and_init stmts in
+        List.exists (contains_tco_candidate func false) init || 
+        contains_tco_candidate func true last
+
+  | While (_, body) -> 
+      contains_tco_candidate func false body
+  
+  | _ -> false
+
+(* 转换语句，将尾递归调用转换为赋值和continue *)
+let rec transform_stmt_for_tco (func: func_def) (is_tail_pos: bool) (fresh_var_gen: unit -> id) (stmt: stmt) : stmt =
+  match stmt with
+  | Return (Some (Call(callee, args))) 
+    when is_tail_pos && callee = func.fname && List.length args = List.length func.params ->
+      let params = func.params in
+      let temp_decls_and_names = List.map (fun arg_expr ->
+        let temp_name = fresh_var_gen () in
+        (temp_name, Decl(temp_name, arg_expr))
+      ) args in
+      let temp_decls = List.map snd temp_decls_and_names in
+      let temp_names = List.map fst temp_decls_and_names in
+      let assignments = List.map2 (fun param temp_name ->
+        Assign(param.pname, Var temp_name)
+      ) params temp_names in
+      Block(temp_decls @ assignments @ [Continue])
+
+  | If (cond, then_s, else_s_opt) ->
+      let new_then = transform_stmt_for_tco func is_tail_pos fresh_var_gen then_s in
+      let new_else_opt = Option.map (transform_stmt_for_tco func is_tail_pos fresh_var_gen) else_s_opt in
+      If (cond, new_then, new_else_opt)
+
+  | Block (stmts) ->
+      if not is_tail_pos || stmts = [] then
+        Block (List.map (transform_stmt_for_tco func false fresh_var_gen) stmts)
+      else
+        let (last, init) = last_and_init stmts in
+        let transformed_init = List.map (transform_stmt_for_tco func false fresh_var_gen) init in
+        let transformed_last = transform_stmt_for_tco func true fresh_var_gen last in
+        Block(transformed_init @ [transformed_last])
+        
+  | While (cond, body) ->
+      While(cond, transform_stmt_for_tco func false fresh_var_gen body)
+
+  | _ -> stmt
+
+(* 单个函数的尾递归优化 *)
+let optimize_func_for_tco (func: func_def) : func_def =
+  let has_tco_candidate = List.exists (contains_tco_candidate func true) func.body in
+  
+  if not has_tco_candidate then
+    func
+  else
+    let counter = ref 0 in
+    let fresh_var_gen () =
+      counter := !counter + 1;
+      "__tco_" ^ func.fname ^ "_" ^ (string_of_int !counter)
+    in
+    let transformed_body_stmts = List.map (transform_stmt_for_tco func true fresh_var_gen) func.body in
+    let true_expr = Literal (IntLit 1) in
+    let loop_body = Block transformed_body_stmts in
+    let new_body = [While (true_expr, loop_body)] in
+    { func with body = new_body }
+
+(* 尾递归优化入口函数 *)
+let optimize_tail_recursion (prog: program) : program =
+  List.map optimize_func_for_tco prog
+
+(*****************************************************************************)
+(* 常量折叠优化                                                            *)
+(*****************************************************************************)
+
+let rec fold_constants_expr expr =
+  match expr with
+  | Literal _ -> expr
+  | Var _ -> expr
+  | BinOp (e1, op, e2) ->
+      let e1' = fold_constants_expr e1 in
+      let e2' = fold_constants_expr e2 in
+      begin match e1', e2' with
+      | Literal (IntLit n1), Literal (IntLit n2) ->
+          let result = match op with
+            | "+" -> n1 + n2
+            | "-" -> n1 - n2
+            | "*" -> n1 * n2
+            | "/" -> n1 / n2
+            | "%" -> n1 mod n2
+            | "<" -> if n1 < n2 then 1 else 0
+            | ">" -> if n1 > n2 then 1 else 0
+            | "<=" -> if n1 <= n2 then 1 else 0
+            | ">=" -> if n1 >= n2 then 1 else 0
+            | "==" -> if n1 = n2 then 1 else 0
+            | "!=" -> if n1 != n2 then 1 else 0
+            | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
+          in
+          Literal (IntLit result)
+      | e, Literal (IntLit 0) when op = "+" -> e
+      | Literal (IntLit 0), e when op = "+" -> e
+      | e, Literal (IntLit 0) when op = "-" -> e
+      | Literal (IntLit 0), e when op = "-" -> UnOp ("-", e)
+      | Literal (IntLit 1), e when op = "*" -> e
+      | e, Literal (IntLit 1) when op = "*" -> e
+      | _, Literal (IntLit 0) when op = "*" -> Literal (IntLit 0)
+      | Literal (IntLit 0), _ when op = "*" -> Literal (IntLit 0)
+      | _ -> BinOp (e1', op, e2')
+      end
+  | UnOp (op, e) ->
+      let e' = fold_constants_expr e in
+      begin match e' with
+      | Literal (IntLit n) ->
+          let result = match op with
+            | "-" -> -n
+            | "!" -> if n = 0 then 1 else 0
+            | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
+          in
+          Literal (IntLit result)
+      | UnOp ("!", e'') -> e''
+      | UnOp ("-", UnOp ("-", e'')) -> e''
+      | _ -> UnOp (op, e')
+      end
+  | Call (fname, args) ->
+      Call (fname, List.map fold_constants_expr args)
+  | Paren e ->
+      let e' = fold_constants_expr e in
+      begin match e' with
+      | Paren e'' -> e''
+      | _ -> Paren e'
+      end
+
+let rec fold_constants_stmt stmt =
+  match stmt with
+  | Block stmts -> Block (List.map fold_constants_stmt stmts)
+  | Empty -> Empty
+  | ExprStmt expr -> ExprStmt (fold_constants_expr expr)
+  | Assign (id, expr) -> Assign (id, fold_constants_expr expr)
+  | Decl (id, expr) -> Decl (id, fold_constants_expr expr)
+  | If (cond, then_stmt, else_stmt_opt) ->
+      let cond' = fold_constants_expr cond in
+      let then_stmt' = fold_constants_stmt then_stmt in
+      let else_stmt_opt' = Option.map fold_constants_stmt else_stmt_opt in
+      If (cond', then_stmt', else_stmt_opt')
+  | While (cond, body) ->
+      let cond' = fold_constants_expr cond in
+      let body' = fold_constants_stmt body in
+      While (cond', body')
+  | Break -> Break
+  | Continue -> Continue
+  | Return expr_opt -> Return (Option.map fold_constants_expr expr_opt)
+
+let fold_constants program =
+  List.map (fun func -> { func with body = List.map fold_constants_stmt func.body }) program
+
+(*****************************************************************************)
+(* 增强版循环优化                                                          *)
+(*****************************************************************************)
+
+(* 1. 循环不变量外提增强版 *)
 let is_invariant expr loop_defs =
   let vars_used = expr_vars expr in
   VarSet.disjoint vars_used loop_defs
 
-(* 检查语句是否是循环不变量 *)
 let is_invariant_stmt stmt loop_defs =
   match stmt with
   | Assign (id, expr) ->
@@ -247,14 +226,71 @@ let is_invariant_stmt stmt loop_defs =
   | Decl (id, expr) ->
       is_invariant expr loop_defs && not (VarSet.mem id loop_defs)
   | ExprStmt expr -> is_invariant expr loop_defs
-  | _ -> false  (* 其他类型语句暂不视为循环不变量 *)
+  | If (cond, then_stmt, else_stmt_opt) ->
+      (* 增强：支持条件语句作为循环不变量 *)
+      is_invariant cond loop_defs &&
+      VarSet.disjoint (stmt_defs then_stmt) loop_defs &&
+      (match else_stmt_opt with
+       | Some else_stmt -> VarSet.disjoint (stmt_defs else_stmt) loop_defs
+       | None -> true)
+  | _ -> false
 
-(* 外提循环不变量 *)
-let rec hoist_invariants_stmt stmt =
+(* 2. 循环融合：合并相邻的相似循环 *)
+let can_fuse_loops loop1 loop2 =
+  match loop1, loop2 with
+  | While (cond1, body1), While (cond2, body2) ->
+      (* 条件相同且循环变量不冲突时可以融合 *)
+      cond1 = cond2 && 
+      VarSet.disjoint (stmt_defs body1) (stmt_defs body2)
+  | _ -> false
+
+let fuse_loops loop1 loop2 =
+  match loop1, loop2 with
+  | While (cond, body1), While (_, body2) ->
+      let fused_body = Block [body1; body2] in
+      While (cond, fused_body)
+  | _ -> failwith "Cannot fuse non-while loops"
+
+(* 3. 循环展开：适度展开小循环 *)
+let unroll_loop count stmt =
+  if count <= 1 then stmt
+  else match stmt with
+    | While (cond, body) ->
+        let unrolled = ref [] in
+        for _ = 1 to count - 1 do
+          unrolled := body :: !unrolled
+        done;
+        let unrolled_body = Block (List.rev !unrolled @ [While (cond, body)]) in
+        While (cond, unrolled_body)
+    | _ -> stmt
+
+(* 循环优化主函数 *)
+let rec optimize_loop_stmt stmt =
   match stmt with
+  | Block stmts ->
+      (* 尝试循环融合 *)
+      let rec fuse_adjacent_loops stmts acc =
+        match stmts with
+        | [] -> List.rev acc
+        | [s] -> List.rev (s :: acc)
+        | s1 :: s2 :: rest ->
+            if can_fuse_loops s1 s2 then
+              let fused = fuse_loops s1 s2 in
+              fuse_adjacent_loops (fused :: rest) acc
+            else
+              fuse_adjacent_loops (s2 :: rest) (s1 :: acc)
+      in
+      let fused_stmts = fuse_adjacent_loops stmts [] in
+      (* 对每个语句应用其他循环优化 *)
+      let optimized_stmts = List.map optimize_loop_stmt fused_stmts in
+      Block optimized_stmts
+      
   | While (cond, body) ->
+      (* 先优化循环体 *)
+      let optimized_body = optimize_loop_stmt body in
+      
       (* 计算循环体中定义的变量 *)
-      let loop_defs = stmt_defs body in
+      let loop_defs = stmt_defs optimized_body in
       
       (* 分离循环不变量和变体 *)
       let rec separate_invariants stmts invariants variants =
@@ -268,7 +304,7 @@ let rec hoist_invariants_stmt stmt =
       in
       
       (* 处理循环体 *)
-      let body' = hoist_invariants_stmt body in
+      let body' = optimize_loop_stmt optimized_body in
       let invariants, variants = 
         match body' with
         | Block stmts -> separate_invariants stmts [] []
@@ -277,51 +313,73 @@ let rec hoist_invariants_stmt stmt =
       
       (* 创建新的循环体 *)
       let new_body = if variants = [] then Empty else Block variants in
+      let loop = While (cond, new_body) in
+      
+      (* 决定是否展开循环（小循环适度展开） *)
+      let loop = 
+        let body_size = List.length variants in
+        if body_size > 0 && body_size <= 3 then  (* 小型循环体 *)
+          unroll_loop 2 loop  (* 展开2次 *)
+        else
+          loop
+      in
       
       (* 创建外提的不变量块和新循环 *)
-      if invariants = [] then
-        While (cond, new_body)
-      else
-        Block (invariants @ [While (cond, new_body)])
-  
-  | Block stmts ->
-      Block (List.map hoist_invariants_stmt stmts)
+      if invariants = [] then loop
+      else Block (invariants @ [loop])
       
   | If (cond, then_stmt, else_stmt_opt) ->
-      let then_stmt' = hoist_invariants_stmt then_stmt in
-      let else_stmt_opt' = Option.map hoist_invariants_stmt else_stmt_opt in
+      let then_stmt' = optimize_loop_stmt then_stmt in
+      let else_stmt_opt' = Option.map optimize_loop_stmt else_stmt_opt in
       If (cond, then_stmt', else_stmt_opt')
       
-  | _ -> stmt  (* 其他语句不变 *)
+  | _ -> stmt
 
-let hoist_loop_invariants program =
+let optimize_loops program =
   List.map (fun func ->
-    { func with body = List.map hoist_invariants_stmt func.body }
+    { func with body = List.map optimize_loop_stmt func.body }
   ) program
 
 (*****************************************************************************)
-(* 强度削弱                                                                   *)
+(* 强度削弱增强版                                                          *)
 (*****************************************************************************)
 
-(* 强度削弱：将乘法转换为加法等 *)
 let rec strength_reduction_expr expr =
   match expr with
   | BinOp (e, "*", Literal (IntLit 2)) ->
-      (* x * 2 → x + x *)
       BinOp (strength_reduction_expr e, "+", strength_reduction_expr e)
   | BinOp (Literal (IntLit 2), "*", e) ->
-      (* 2 * x → x + x *)
       BinOp (strength_reduction_expr e, "+", strength_reduction_expr e)
   | BinOp (e, "*", Literal (IntLit 4)) ->
-      (* x * 4 → x + x + x + x *)
       let e' = strength_reduction_expr e in
       BinOp (BinOp (e', "+", e'), "+", BinOp (e', "+", e'))
   | BinOp (e, "*", Literal (IntLit 8)) ->
-      (* x * 8 → x + x + x + x + x + x + x + x *)
       let e' = strength_reduction_expr e in
       let double = BinOp (e', "+", e') in
       let quadruple = BinOp (double, "+", double) in
       BinOp (quadruple, "+", quadruple)
+  | BinOp (e, "*", Literal (IntLit n)) when n > 0 && (n land (n - 1)) = 0 ->
+      (* 增强：处理任意2的幂次乘法 *)
+      let rec power_of_two n =
+        if n = 1 then 0
+        else 1 + power_of_two (n / 2)
+      in
+      let exp = power_of_two n in
+      let rec build_add e' exp =
+        if exp = 1 then BinOp (e', "+", e')
+        else BinOp (build_add e' (exp - 1), "+", build_add e' (exp - 1))
+      in
+      build_add (strength_reduction_expr e) exp
+  | BinOp (e, "/", Literal (IntLit n)) when n > 0 && (n land (n - 1)) = 0 ->
+      (* 增强：处理除以2的幂次，转换为右移 *)
+      let rec power_of_two n =
+        if n = 1 then 0
+        else 1 + power_of_two (n / 2)
+      in
+      let exp = power_of_two n in
+      let e' = strength_reduction_expr e in
+      (* 假设>>运算符可用，表示右移 *)
+      BinOp (e', ">>", Literal (IntLit exp))
   | BinOp (e1, op, e2) ->
       BinOp (strength_reduction_expr e1, op, strength_reduction_expr e2)
   | UnOp (op, e) ->
@@ -330,18 +388,14 @@ let rec strength_reduction_expr expr =
       Call (fname, List.map strength_reduction_expr args)
   | Paren e ->
       Paren (strength_reduction_expr e)
-  | _ -> expr  (* 其他表达式不变 *)
+  | _ -> expr
 
 let rec strength_reduction_stmt stmt =
   match stmt with
-  | Block stmts ->
-      Block (List.map strength_reduction_stmt stmts)
-  | ExprStmt expr ->
-      ExprStmt (strength_reduction_expr expr)
-  | Assign (id, expr) ->
-      Assign (id, strength_reduction_expr expr)
-  | Decl (id, expr) ->
-      Decl (id, strength_reduction_expr expr)
+  | Block stmts -> Block (List.map strength_reduction_stmt stmts)
+  | ExprStmt expr -> ExprStmt (strength_reduction_expr expr)
+  | Assign (id, expr) -> Assign (id, strength_reduction_expr expr)
+  | Decl (id, expr) -> Decl (id, strength_reduction_expr expr)
   | If (cond, then_stmt, else_stmt_opt) ->
       let cond' = strength_reduction_expr cond in
       let then_stmt' = strength_reduction_stmt then_stmt in
@@ -351,15 +405,13 @@ let rec strength_reduction_stmt stmt =
       let cond' = strength_reduction_expr cond in
       let body' = strength_reduction_stmt body in
       While (cond', body')
-  | _ -> stmt  (* 其他语句不变 *)
+  | _ -> stmt
 
 let strength_reduction program =
-  List.map (fun func ->
-    { func with body = List.map strength_reduction_stmt func.body }
-  ) program
+  List.map (fun func -> { func with body = List.map strength_reduction_stmt func.body }) program
 
 (*****************************************************************************)
-(* 增强版死代码消除                                                         *)
+(* 死代码消除                                                              *)
 (*****************************************************************************)
 
 let is_const_true expr =
@@ -372,7 +424,6 @@ let is_const_false expr =
   | Literal (IntLit 0) -> true
   | _ -> false
 
-(* 移除不可达语句 *)
 let rec eliminate_dead_stmt reachable stmt =
   if not reachable then (None, false)
   else
@@ -432,7 +483,6 @@ and eliminate_dead_stmts reachable stmts =
       in
       (stmts', rest_reachable)
 
-(* 收集所有被使用的变量 *)
 let rec collect_vars_expr vars expr =
   match expr with
   | Literal _ -> vars
@@ -447,8 +497,7 @@ let rec collect_vars_expr vars expr =
 
 let rec collect_vars_stmt vars stmt =
   match stmt with
-  | Block stmts ->
-      List.fold_left collect_vars_stmt vars stmts
+  | Block stmts -> List.fold_left collect_vars_stmt vars stmts
   | Empty -> vars
   | ExprStmt expr -> collect_vars_expr vars expr
   | Assign (_, expr) -> collect_vars_expr vars expr
@@ -470,7 +519,6 @@ let rec collect_vars_stmt vars stmt =
       | None -> vars
       end
 
-(* 移除未使用的变量 *)
 let rec remove_unused_stmt used_vars stmt =
   match stmt with
   | Block stmts ->
@@ -519,7 +567,6 @@ and remove_unused_expr used_vars expr =
   | Paren e ->
       Paren (remove_unused_expr used_vars e)
 
-(* 简化空语句和空块 *)
 let rec simplify_empty_stmt stmt =
   match stmt with
   | Block stmts ->
@@ -542,23 +589,17 @@ let rec simplify_empty_stmt stmt =
       While (cond, body')
   | _ -> stmt
 
-(* 增强版死代码消除入口 *)
 let eliminate_dead_code program =
   List.map (fun func ->
-    (* 1. 第一次消除不可达语句 *)
     let body_reachable, _ = eliminate_dead_stmts true func.body in
-    (* 2. 第二次深度消除（处理嵌套块） *)
     let body_deep_reachable = 
       List.map (fun s -> 
         let s', _ = eliminate_dead_stmt true s in
         Option.value s' ~default:Empty
       ) body_reachable
     in
-    (* 3. 收集使用的变量 *)
     let used_vars = List.fold_left collect_vars_stmt VarSet.empty body_deep_reachable in
-    (* 4. 移除未使用的变量 *)
     let body_unused_removed = List.map (remove_unused_stmt used_vars) body_deep_reachable in
-    (* 5. 简化空语句 *)
     let body_simplified = List.map simplify_empty_stmt body_unused_removed in
     { func with body = body_simplified }
   ) program
@@ -571,7 +612,7 @@ let optimize program =
   program 
   |> fold_constants                (* 1. 常量折叠 *)
   |> eliminate_dead_code           (* 2. 死代码消除 *)
-  |> hoist_loop_invariants         (* 3. 循环不变量外提 *)
-  |> strength_reduction            (* 4. 强度削弱 *)
-  |> eliminate_dead_code           (* 5. 再次死代码消除，清理优化产生的冗余 *)
+  |> optimize_loops                (* 3. 增强版循环优化（不变量外提+融合+适度展开） *)
+  |> strength_reduction            (* 4. 增强版强度削弱 *)
+  |> eliminate_dead_code           (* 5. 再次死代码消除 *)
   |> optimize_tail_recursion       (* 6. 尾递归优化 *)
