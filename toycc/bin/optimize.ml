@@ -475,21 +475,26 @@ let eliminate_dead_code program =
     { func with body = body_simplified }
   ) program
 
-(* 迭代优化直到没有变化 *)
-let rec optimize_iteratively program =
-  let optimized = 
-    program
-    |> propagate_constants
-    |> fold_constants
-    |> eliminate_dead_code
-    |> (fun p -> List.map (fun f -> { f with body = List.map apply_loop_optimizations f.body }) p)
+(* 限制迭代次数的优化，防止无限循环 *)
+let optimize_with_limit max_iterations program =
+  let rec optimize_iter count program =
+    if count >= max_iterations then
+      program  (* 达到最大迭代次数，返回当前结果 *)
+    else
+      let optimized = 
+        program
+        |> propagate_constants
+        |> fold_constants
+        |> eliminate_dead_code
+        |> (fun p -> List.map (fun f -> { f with body = List.map apply_loop_optimizations f.body }) p)
+      in
+      if program = optimized then
+        program  (* 没有变化，提前退出 *)
+      else
+        optimize_iter (count + 1) optimized
   in
-  if program = optimized then
-    program
-  else
-    optimize_iteratively optimized
+  optimize_iter 0 program
 
-(* 完整的优化流程 *)
+(* 完整的优化流程，设置合理的最大迭代次数 *)
 let optimize program =
-  optimize_iteratively program
-    
+  optimize_with_limit 1 program  (* 限制最多10次迭代 *)
