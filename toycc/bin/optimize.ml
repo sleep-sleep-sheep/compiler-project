@@ -1,5 +1,147 @@
 open Ast
 
+(* 常量值表示 *)
+type const_value =
+  | IntVal of int
+  | Unknown
+
+(* 环境：变量到常量值的映射 *)
+type env = (id * const_value) list
+
+(* 查找变量的常量值 *)
+let rec lookup env id =
+  match env with
+  | [] -> Unknown
+  | (var, value) :: rest ->
+      if var = id then value else lookup rest id
+
+(* 更新环境中的变量值 *)
+let update env id value =
+  (id, value) :: env
+
+(* 常量传播表达式优化 *)
+let rec propagate_constants_expr env expr =
+  match expr with
+  | Literal (IntLit n) -> (expr, IntVal n)
+  | Var id ->
+      begin match lookup env id with
+      | IntVal n -> (Literal (IntLit n), IntVal n)
+      | Unknown -> (Var id, Unknown)
+      end
+  | BinOp (e1, op, e2) ->
+      let e1', v1 = propagate_constants_expr env e1 in
+      let e2', v2 = propagate_constants_expr env e2 in
+      begin match v1, v2 with
+      | IntVal n1, IntVal n2 ->
+          (* 可以进行常量折叠 *)
+          let result = match op with
+            | "+" -> n1 + n2
+            | "-" -> n1 - n2
+            | "*" -> n1 * n2
+            | "/" -> n1 / n2
+            | "%" -> n1 mod n2
+            | "<" -> if n1 < n2 then 1 else 0
+            | ">" -> if n1 > n2 then 1 else 0
+            | "<=" -> if n1 <= n2 then 1 else 0
+            | ">=" -> if n1 >= n2 then 1 else 0
+            | "==" -> if n1 = n2 then 1 else 0
+            | "!=" -> if n1 != n2 then 1 else 0
+            | _ -> failwith ("Unsupported operator: " ^ op)
+          in
+          (Literal (IntLit result), IntVal result)
+      | _ ->
+          (* 不能完全折叠，但可能部分优化 *)
+          let opt_e1 = if v1 != Unknown then e1' else e1 in
+          let opt_e2 = if v2 != Unknown then e2' else e2 in
+          (BinOp (opt_e1, op, opt_e2), Unknown)
+      end
+  | UnOp (op, e) ->
+      let e', v = propagate_constants_expr env e in
+      begin match v with
+      | IntVal n ->
+          let result = match op with
+            | "-" -> -n
+            | "!" -> if n = 0 then 1 else 0
+            | _ -> failwith ("Unsupported unary operator: " ^ op)
+          in
+          (Literal (IntLit result), IntVal result)
+      | Unknown ->
+          (UnOp (op, e'), Unknown)
+      end
+  | Call (fname, args) ->
+      let args' = List.map (fun arg -> fst (propagate_constants_expr env arg)) args in
+      (Call (fname, args'), Unknown)  (* 函数调用结果视为未知 *)
+  | Paren e ->
+      let e', v = propagate_constants_expr env e in
+      (Paren e', v)
+
+(* 常量传播语句优化 *)
+let rec propagate_constants_stmt env stmt =
+  match stmt with
+  | Block stmts ->
+      let env', stmts' = propagate_constants_stmts env stmts in
+      (env', Block stmts')
+  | Empty -> (env, Empty)
+  | ExprStmt expr ->
+      let expr', _ = propagate_constants_expr env expr in
+      (env, ExprStmt expr')
+  | Assign (id, expr) ->
+      let expr', value = propagate_constants_expr env expr in
+      let new_env = update env id value in
+      (new_env, Assign (id, expr'))
+  | Decl (id, expr) ->
+      let expr', value = propagate_constants_expr env expr in
+      let new_env = update env id value in
+      (new_env, Decl (id, expr'))
+  | If (cond, then_stmt, else_stmt_opt) ->
+      let cond', _ = propagate_constants_expr env cond in
+      
+      (* 对then分支和else分支分别进行常量传播 *)
+      let then_env, then_stmt' = propagate_constants_stmt env then_stmt in
+      let else_env, else_stmt_opt' = 
+        match else_stmt_opt with
+        | Some else_stmt ->
+            let env', stmt' = propagate_constants_stmt env else_stmt in
+            (env', Some stmt')
+        | None -> (env, None)
+      in
+      
+      (* 合并两个分支的环境 - 只保留在两个分支中值相同的变量 *)
+      let merged_env = 
+        List.fold_left (fun acc (id, val1) ->
+          match lookup else_env id with
+          | IntVal val2 when val1 = IntVal val2 -> (id, val1) :: acc
+          | _ -> acc
+        ) [] then_env
+      in
+      
+      (merged_env, If (cond', then_stmt', else_stmt_opt'))
+  | While (cond, body) ->
+      let cond', _ = propagate_constants_expr env cond in
+      (* 循环体可能执行多次，保守处理环境 *)
+      let _, body' = propagate_constants_stmt env body in
+      (env, While (cond', body'))  (* 不更新环境，因为循环可能执行0次或多次 *)
+  | Break -> (env, Break)
+  | Continue -> (env, Continue)
+  | Return expr_opt ->
+      let expr_opt' = Option.map (fun e -> fst (propagate_constants_expr env e)) expr_opt in
+      (env, Return expr_opt')  (* return后不更新环境 *)
+
+and propagate_constants_stmts env stmts =
+  match stmts with
+  | [] -> (env, [])
+  | stmt :: rest ->
+      let env', stmt' = propagate_constants_stmt env stmt in
+      let env'', rest' = propagate_constants_stmts env' rest in
+      (env'', stmt' :: rest')
+
+(* 常量传播入口 *)
+let propagate_constants program =
+  List.map (fun func ->
+    let _, body' = propagate_constants_stmts [] func.body in
+    { func with body = body' }
+  ) program
+
 (* 强化版常量折叠优化 *)
 let rec fold_constants_expr expr =
   match expr with
@@ -16,7 +158,6 @@ let rec fold_constants_expr expr =
             | "*" -> n1 * n2
             | "/" -> n1 / n2
             | "%" -> n1 mod n2
-            (* 比较运算符支持 *)
             | "<" -> if n1 < n2 then 1 else 0
             | ">" -> if n1 > n2 then 1 else 0
             | "<=" -> if n1 <= n2 then 1 else 0
@@ -26,7 +167,6 @@ let rec fold_constants_expr expr =
             | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
           in
           Literal (IntLit result)
-      (* 扩展部分折叠规则集 *)
       | e, Literal (IntLit 0) when op = "+" -> e  (* x + 0 → x *)
       | Literal (IntLit 0), e when op = "+" -> e  (* 0 + x → x *)
       | e, Literal (IntLit 0) when op = "-" -> e  (* x - 0 → x *)
@@ -90,7 +230,6 @@ let fold_constants program =
   List.map (fun func ->
     { func with body = List.map fold_constants_stmt func.body }
   ) program
-
 
 (* 增强版死代码消除 *)
 module VarSet = Set.Make(String)
@@ -203,7 +342,7 @@ let rec collect_vars_stmt vars stmt =
       | None -> vars
       end
 
-(* 移除未使用的变量 *)
+(* 移除未使用的变量和表达式 *)
 let rec remove_unused_stmt used_vars stmt =
   match stmt with
   | Block stmts ->
@@ -214,7 +353,9 @@ let rec remove_unused_stmt used_vars stmt =
         | _ -> Some s'
       ) stmts)
   | Empty -> Empty
-  | ExprStmt expr -> ExprStmt (remove_unused_expr used_vars expr)
+  | ExprStmt expr -> 
+      let expr' = remove_unused_expr used_vars expr in
+      ExprStmt expr'
   | Assign (id, expr) ->
       if VarSet.mem id used_vars then
         Assign (id, remove_unused_expr used_vars expr)
@@ -275,6 +416,44 @@ let rec simplify_empty_stmt stmt =
       While (cond, body')
   | _ -> stmt
 
+(* 循环优化：移除循环中的不变量 *)
+let  find_loop_invariants stmt =
+  match stmt with
+  | Block stmts ->
+      (* 简单实现：假设块中的第一个非声明语句前的都是不变量 *)
+      let rec split_invariants stmts =
+        match stmts with
+        | [] -> ([], [])
+        | (Decl _ as d) :: rest ->
+            let inv, body = split_invariants rest in
+            (d :: inv, body)
+        | stmt :: rest -> ([], stmt :: rest)
+      in
+      let invariants, body = split_invariants stmts in
+      (invariants, Block body)
+  | _ -> ([], stmt)
+
+let optimize_loop loop_body =
+  let invariants, body = find_loop_invariants loop_body in
+  (invariants, body)
+
+let rec apply_loop_optimizations stmt =
+  match stmt with
+  | While (cond, body) ->
+      let invariants, optimized_body = optimize_loop body in
+      let optimized_body' = apply_loop_optimizations optimized_body in
+      if invariants = [] then
+        While (cond, optimized_body')
+      else
+        Block (invariants @ [While (cond, optimized_body')])
+  | Block stmts ->
+      Block (List.map apply_loop_optimizations stmts)
+  | If (cond, then_stmt, else_stmt_opt) ->
+      let then_stmt' = apply_loop_optimizations then_stmt in
+      let else_stmt_opt' = Option.map apply_loop_optimizations else_stmt_opt in
+      If (cond, then_stmt', else_stmt_opt')
+  | _ -> stmt
+
 (* 增强版死代码消除入口 *)
 let eliminate_dead_code program =
   List.map (fun func ->
@@ -296,8 +475,21 @@ let eliminate_dead_code program =
     { func with body = body_simplified }
   ) program
 
-(* 完整的优化流程 - 不包含常量传播 *)
+(* 迭代优化直到没有变化 *)
+let rec optimize_iteratively program =
+  let optimized = 
+    program
+    |> propagate_constants
+    |> fold_constants
+    |> eliminate_dead_code
+    |> (fun p -> List.map (fun f -> { f with body = List.map apply_loop_optimizations f.body }) p)
+  in
+  if program = optimized then
+    program
+  else
+    optimize_iteratively optimized
+
+(* 完整的优化流程 *)
 let optimize program =
-  program 
-  |> fold_constants        (* 强化的常量折叠 *)
-  |> eliminate_dead_code   (* 强化的死代码消除 *)
+  optimize_iteratively program
+    
