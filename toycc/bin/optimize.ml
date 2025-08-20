@@ -105,13 +105,13 @@ let optimize_func_for_tco (func: func_def) : func_def =
     let new_body = [While (true_expr, loop_body)] in
     { func with body = new_body }
 
-(* 尾递归优化入口 *)
-let optimize_tail_recursion (prog: program) : program =
-  List.map optimize_func_for_tco prog
+(* 尾递归优化入口函数 - 新增的缺失函数 *)
+let optimize_tail_recursion (program: program) : program =
+  List.map optimize_func_for_tco program
 
 
 (*****************************************************************************)
-(* 强化版常量折叠优化                                                       *)
+(* 常量折叠优化                                                             *)
 (*****************************************************************************)
 
 let rec fold_constants_expr expr =
@@ -206,7 +206,7 @@ let fold_constants program =
 
 
 (*****************************************************************************)
-(* 增强版死代码消除                                                         *)
+(* 死代码消除与循环优化                                                     *)
 (*****************************************************************************)
 
 module VarSet = Set.Make(String)
@@ -220,6 +220,71 @@ let is_const_false expr =
   match expr with
   | Literal (IntLit 0) -> true
   | _ -> false
+
+(* 循环不变式外提辅助函数 *)
+let rec is_loop_invariant (var_set: VarSet.t) expr =
+  match expr with
+  | Literal _ -> true
+  | Var id -> not (VarSet.mem id var_set)
+  | BinOp (e1, _, e2) -> is_loop_invariant var_set e1 && is_loop_invariant var_set e2
+  | UnOp (_, e) -> is_loop_invariant var_set e
+  | Call (_, args) -> List.for_all (is_loop_invariant var_set) args
+  | Paren e -> is_loop_invariant var_set e
+
+(* 收集循环中被修改的变量 *)
+let rec collect_modified_vars_stmt vars stmt =
+  match stmt with
+  | Assign (id, _) -> VarSet.add id vars
+  | Decl (id, _) -> VarSet.add id vars
+  | Block stmts -> List.fold_left collect_modified_vars_stmt vars stmts
+  | If (_, then_stmt, else_stmt_opt) ->
+      let vars = collect_modified_vars_stmt vars then_stmt in
+      begin match else_stmt_opt with
+      | Some else_stmt -> collect_modified_vars_stmt vars else_stmt
+      | None -> vars
+      end
+  | While (_, body) -> collect_modified_vars_stmt vars body
+  | _ -> vars
+
+(* 提取循环不变式 *)
+let rec extract_loop_invariants modified_vars stmt =
+  match stmt with
+  | Block stmts ->
+      let rec split_invariants_and_rest stmts =
+        match stmts with
+        | [] -> ([], [])
+        | stmt::rest ->
+            let (inv, rest_stmt) = extract_loop_invariants modified_vars stmt in
+            let (inv_rest, rest_rest) = split_invariants_and_rest rest in
+            (inv @ inv_rest, rest_stmt @ rest_rest)
+      in
+      let invariants, rest = split_invariants_and_rest stmts in
+      (invariants, [Block rest])
+  
+  | Decl (_, expr) when is_loop_invariant modified_vars expr ->
+      ([stmt], [])  (* 这是循环不变式，提取出去 *)
+      
+  | Assign (id, expr) when is_loop_invariant modified_vars expr && 
+                          not (VarSet.mem id modified_vars) ->
+      ([stmt], [])  (* 这是循环不变式，提取出去 *)
+      
+  | _ -> ([], [stmt])  (* 不是循环不变式，保留在循环内 *)
+
+(* 优化循环：提取循环不变式 *)
+let optimize_loop stmt =
+  match stmt with
+  | While (cond, body) ->
+      (* 收集循环体中被修改的变量 *)
+      let modified_vars = collect_modified_vars_stmt VarSet.empty body in
+      (* 提取循环不变式 *)
+      let invariants, body_stmts = extract_loop_invariants modified_vars body in
+      let new_body = Block body_stmts in
+      (* 如果有不变式，创建一个包含不变式和循环的块 *)
+      if invariants <> [] then
+        Block (invariants @ [While (cond, new_body)])
+      else
+        While (cond, new_body)
+  | _ -> stmt
 
 (* 移除不可达语句 *)
 let rec eliminate_dead_stmt reachable stmt =
@@ -391,33 +456,49 @@ let rec simplify_empty_stmt stmt =
       While (cond, body')
   | _ -> stmt
 
-(* 增强版死代码消除入口 *)
-let eliminate_dead_code program =
+(* 循环优化和死代码消除主函数 *)
+let eliminate_dead_code_and_optimize_loops program =
   List.map (fun func ->
-    (* 1. 第一次消除不可达语句 *)
-    let body_reachable, _ = eliminate_dead_stmts true func.body in
-    (* 2. 第二次深度消除（处理嵌套块） *)
+    (* 1. 先进行循环优化 *)
+    let body_with_loop_opt = List.map optimize_loop func.body in
+    
+    (* 2. 消除不可达语句 *)
+    let body_reachable, _ = eliminate_dead_stmts true body_with_loop_opt in
+    
+    (* 3. 深度消除处理嵌套块 *)
     let body_deep_reachable = 
       List.map (fun s -> 
         let s', _ = eliminate_dead_stmt true s in
         Option.value s' ~default:Empty
       ) body_reachable
     in
-    (* 3. 收集使用的变量 *)
+    
+    (* 4. 收集使用的变量 *)
     let used_vars = List.fold_left collect_vars_stmt VarSet.empty body_deep_reachable in
-    (* 4. 移除未使用的变量 *)
+    
+    (* 5. 移除未使用的变量 *)
     let body_unused_removed = List.map (remove_unused_stmt used_vars) body_deep_reachable in
-    (* 5. 简化空语句 *)
+    
+    (* 6. 简化空语句 *)
     let body_simplified = List.map simplify_empty_stmt body_unused_removed in
+    
     { func with body = body_simplified }
   ) program
+
 
 (*****************************************************************************)
 (* 最终的优化流水线                                                         *)
 (*****************************************************************************)
 
+let rec apply_n_times n f x =
+  if n = 0 then x
+  else apply_n_times (n-1) f (f x)
+
 let optimize program =
   program 
-  |> fold_constants        (* 1. 常量折叠 *)
-  |> eliminate_dead_code   (* 2. 死代码消除 *)
-  |> optimize_tail_recursion (* 3. 尾递归优化 *)
+  |> fold_constants                     (* 1. 常量折叠 *)
+  |> eliminate_dead_code_and_optimize_loops  (* 2. 死代码消除和循环优化 *)
+  |> apply_n_times 2 (fun p -> p |> fold_constants |> eliminate_dead_code_and_optimize_loops)
+  |> optimize_tail_recursion            (* 3. 尾递归优化 *)
+  |> fold_constants                     (* 最后再做一次常量折叠 *)
+    
