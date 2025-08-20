@@ -99,8 +99,8 @@ type instruction =
   | Slti of reg * reg * int 
   | Sltu of reg * reg * reg 
   | Sltiu of reg * reg * int 
-  | Lw of reg * reg * int  (* 修改为 reg * base_reg * offset 形式 *)
-  | Sw of reg * reg * int  (* 修改为 reg * base_reg * offset 形式 *)
+  | Lw of reg * reg * int  (* reg * base_reg * offset 形式 *)
+  | Sw of reg * reg * int  (* reg * base_reg * offset 形式 *)
   | Beq of reg * reg * string 
   | Bne of reg * reg * string 
   | Blt of reg * reg * string 
@@ -260,7 +260,7 @@ type codegen_context =
   ; ret_val_offset : int          (* 函数返回值在栈帧中的偏移 (相对fp) *)
   ; stack_args_offset : int       (* 栈参数区起始偏移 (相对sp) *)
   ; spill_area_size : int         (* 寄存器溢出区大小 *)
-  ; var_frequency : (string, int) Hashtbl.t  (* 变量访问频率表 *)
+  ; var_reg_map : (string * reg) list ref  (* 变量到寄存器的映射，用于缓存 *)
   }
 
 (* 定义临时寄存器列表 - 被调用者保存 *)
@@ -304,7 +304,7 @@ let create_context _symbol_table func_name frame_size call_results_area_size
     ret_val_offset = ret_val_offset;
     stack_args_offset = stack_args_offset;
     spill_area_size = spill_area_size;
-    var_frequency = Hashtbl.create 10;  (* 变量访问频率表 *)
+    var_reg_map = ref [];  (* 初始化变量-寄存器映射 *)
   }
 
 (* 生成新标签 *)
@@ -313,54 +313,19 @@ let new_label ctx prefix =
   ctx.label_counter <- ctx.label_counter + 1;
   label
 
-(* 分析变量访问频率，用于寄存器分配优化 *)
-let rec analyze_var_frequency ctx (expr: Ast.expr) =
-  match expr with
-  | Ast.Var id ->
-    Hashtbl.replace ctx.var_frequency id 
-      (1 + try Hashtbl.find ctx.var_frequency id with Not_found -> 0)
-  | Ast.Paren e -> analyze_var_frequency ctx e
-  | Ast.UnOp (_, e) -> analyze_var_frequency ctx e
-  | Ast.BinOp (e1, _, e2) ->
-    analyze_var_frequency ctx e1;
-    analyze_var_frequency ctx e2
-  | Ast.Call (_, args) ->
-    List.iter (analyze_var_frequency ctx) args
-  | _ -> ()
-
-let rec analyze_stmt_frequency ctx (stmt: Ast.stmt) =
-  match stmt with
-  | Ast.ExprStmt e -> analyze_var_frequency ctx e
-  | Ast.Block stmts -> List.iter (analyze_stmt_frequency ctx) stmts
-  | Ast.Return (Some e) -> analyze_var_frequency ctx e
-  | Ast.Return None -> ()
-  | Ast.If (cond, s1, s2_opt) ->
-    analyze_var_frequency ctx cond;
-    analyze_stmt_frequency ctx s1;
-    Option.iter (analyze_stmt_frequency ctx) s2_opt
-  | Ast.While (cond, body) ->
-    analyze_var_frequency ctx cond;
-    analyze_stmt_frequency ctx body
-  | Ast.Break | Ast.Continue -> ()
-  | Ast.Decl (_, e) -> analyze_var_frequency ctx e
-  | Ast.Assign (id, e) ->
-    Hashtbl.replace ctx.var_frequency id 
-      (1 + try Hashtbl.find ctx.var_frequency id with Not_found -> 0);
-    analyze_var_frequency ctx e
-  | Ast.Empty -> ()
-
-(* 优化：使用LRU算法选择溢出寄存器 *)
+(* 优化：使用LRU（最近最少使用）算法选择溢出寄存器 *)
 let get_least_recently_used_reg used_regs =
   match !used_regs with
   | [] -> None
   | regs ->
-    (* 找到时间戳最小的寄存器 *)
-    let compare (_, t1) (_, t2) = compare t1 t2 in
-    Some (fst (List.fold_left (fun acc r -> if compare r acc < 0 then r else acc) (List.hd regs) regs))
+      (* 找到时间戳最小的寄存器 *)
+      let compare_by_timestamp (_, t1) (_, t2) = compare t1 t2 in
+      let sorted = List.sort compare_by_timestamp regs in
+      Some (fst (List.hd sorted))
 
 (* 临时寄存器管理 - 带溢出机制优化 *)
 let spill_one_register ctx =
-  (* 优化：选择最近最少使用的寄存器溢出 *)
+  (* 选择最近最少使用的寄存器溢出 *)
   let reg_to_spill = 
     match get_least_recently_used_reg ctx.used_regs with
     | Some reg -> reg
@@ -378,13 +343,16 @@ let spill_one_register ctx =
   ctx.spill_offset <- ctx.spill_offset - 4;
   let spill_instr = Sw (reg_to_spill, Fp, offset) in
   
-  (* 更新上下文状态 *)
+  (* 更新上下文状态：从used_regs移除 *)
   ctx.used_regs := List.filter (fun (r, _) -> r <> reg_to_spill) !(ctx.used_regs);
   ctx.free_regs := reg_to_spill :: !(ctx.free_regs);
   
-  (* 记录溢出寄存器的最后使用时间 *)
+  (* 记录溢出的寄存器及其位置和时间戳 *)
   let last_used = try List.assoc reg_to_spill !(ctx.used_regs) with Not_found -> 0 in
   ctx.spill_stack := {reg = reg_to_spill; offset; last_used} :: !(ctx.spill_stack);
+  
+  (* 从变量-寄存器映射中移除 *)
+  ctx.var_reg_map := List.filter (fun (_, r) -> r <> reg_to_spill) !(ctx.var_reg_map);
   
   spill_instr
 
@@ -395,7 +363,7 @@ let get_temp_reg ctx =
       (* 有可用寄存器，直接使用 *)
       ctx.free_regs := rest;
       ctx.timestamp <- ctx.timestamp + 1;
-      (* 记录寄存器最后使用时间 *)
+      (* 记录使用时间戳 *)
       ctx.used_regs := (reg, ctx.timestamp) :: !(ctx.used_regs);
       reg, []
     | [] ->
@@ -406,47 +374,47 @@ let get_temp_reg ctx =
   in
   get_reg ()
 
-(* 优先为高频访问变量分配寄存器 *)
-let get_preferred_reg_for_var ctx var_name =
-  let freq = try Hashtbl.find ctx.var_frequency var_name with Not_found -> 0 in
-  if freq > 3 then  (* 高频访问变量 *)
-    match !(ctx.free_regs) with
-    | [] -> None  (* 没有可用寄存器 *)
-    | regs -> Some (List.hd regs)  (* 优先分配第一个可用寄存器 *)
-  else
-    None
-
 let release_temp_reg ctx reg =
+  let rec find_and_remove reg = function
+    | [] -> []
+    | (r, _) :: rest when r = reg -> rest
+    | x :: rest -> x :: find_and_remove reg rest
+  in
+  
   if List.exists (fun (r, _) -> r = reg) !(ctx.used_regs) then begin
     (* 从used_regs移除，添加到free_regs *)
-    ctx.used_regs := List.filter (fun (r, _) -> r <> reg) !(ctx.used_regs);
+    ctx.used_regs := find_and_remove reg !(ctx.used_regs);
     ctx.free_regs := reg :: !(ctx.free_regs);
     
-    (* 尝试从溢出栈恢复寄存器 - 优化：只在需要时恢复 *)
+    (* 尝试从溢出栈恢复最近使用的寄存器 *)
     let try_restore () =
       match !(ctx.spill_stack) with
-      | spill :: spills when List.length !(ctx.free_regs) > 2 ->
-        (* 当有多个空闲寄存器时才恢复，减少频繁交换 *)
-        let restore_instr = Lw (spill.reg, Fp, spill.offset) in
-        ctx.spill_stack := spills;
-        ctx.timestamp <- ctx.timestamp + 1;
-        ctx.used_regs := (spill.reg, ctx.timestamp) :: !(ctx.used_regs);
-        ctx.free_regs := List.filter (fun r -> r <> spill.reg) !(ctx.free_regs);
-        [restore_instr]
-      | _ -> []
+      | [] -> []
+      | spills ->
+        (* 按最近使用排序，优先恢复最近使用的 *)
+        let sorted_spills = List.sort (fun a b -> compare b.last_used a.last_used) spills in
+        let spill = List.hd sorted_spills in
+        (* 当有空闲寄存器时才恢复 *)
+        if List.length !(ctx.free_regs) > 1 then
+          let restore_instr = Lw (spill.reg, Fp, spill.offset) in
+          ctx.spill_stack := List.filter (fun s -> s.reg <> spill.reg) spills;
+          ctx.timestamp <- ctx.timestamp + 1;
+          ctx.used_regs := (spill.reg, ctx.timestamp) :: !(ctx.used_regs);
+          ctx.free_regs := List.filter (fun r -> r <> spill.reg) !(ctx.free_regs);
+          [restore_instr]
+        else
+          []
     in
     try_restore ()
   end else
     []
 
-(* 更新寄存器使用时间戳，表示最近使用过 *)
+(* 更新寄存器的使用时间戳，表示最近使用过 *)
 let touch_reg ctx reg =
-  if List.exists (fun (r, _) -> r = reg) !(ctx.used_regs) then begin
-    ctx.timestamp <- ctx.timestamp + 1;
-    ctx.used_regs := 
-      (reg, ctx.timestamp) :: 
-      List.filter (fun (r, _) -> r <> reg) !(ctx.used_regs)
-  end
+  ctx.timestamp <- ctx.timestamp + 1;
+  ctx.used_regs := 
+    List.map (fun (r, t) -> if r = reg then (r, ctx.timestamp) else (r, t)) 
+    !(ctx.used_regs)
 
 (* 为函数调用结果分配栈空间 *)
 let alloc_call_result ctx =
@@ -507,23 +475,21 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     reg, spill_instrs @ instrs
 
   | Ast.Var id ->
-    (* 优先为高频访问变量分配寄存器 *)
-    let reg, spill_instrs = 
-      match get_preferred_reg_for_var ctx id with
-      | Some preferred_reg ->
-        (* 如果首选寄存器可用，直接使用 *)
-        if List.mem preferred_reg !(ctx.free_regs) then
-          let () = ctx.free_regs := List.filter (fun r -> r <> preferred_reg) !(ctx.free_regs) in
-          ctx.timestamp <- ctx.timestamp + 1;
-          ctx.used_regs := (preferred_reg, ctx.timestamp) :: !(ctx.used_regs);
-          preferred_reg, []
-        else
-          get_temp_reg ctx
-      | None ->
-        get_temp_reg ctx
-    in
-    let offset = get_var_offset ctx id in
-    reg, spill_instrs @ [ Lw (reg, Fp, offset) ]  (* 从fp偏移加载变量 *)
+    (* 优化：检查变量是否已在寄存器中缓存 *)
+    begin match List.assoc_opt id !(ctx.var_reg_map) with
+    | Some reg ->
+      (* 变量已在寄存器中，直接使用并更新时间戳 *)
+      touch_reg ctx reg;
+      reg, []
+    | None ->
+      (* 变量不在寄存器中，从内存加载 *)
+      let reg, spill_instrs = get_temp_reg ctx in
+      let offset = get_var_offset ctx id in
+      let load_instr = Lw (reg, Fp, offset) in
+      (* 将变量映射到寄存器，以便后续复用 *)
+      ctx.var_reg_map := (id, reg) :: !(ctx.var_reg_map);
+      reg, spill_instrs @ [load_instr]
+    end
 
   | Ast.Paren e -> gen_expr ctx e
 
@@ -531,7 +497,17 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let e_reg, e_instrs = gen_expr ctx e in
     touch_reg ctx e_reg;  (* 标记为最近使用 *)
     
-    let result_reg, spill_instrs = get_temp_reg ctx in
+    (* 优化：尝试复用操作数寄存器作为结果寄存器 *)
+    let result_reg, spill_instrs, release_e =
+      match op with
+      | "-" | "!" ->
+        (* 这些操作可以安全复用操作数寄存器 *)
+        e_reg, [], false
+      | _ ->
+        let r, s = get_temp_reg ctx in
+        r, s, true
+    in
+    
     let op_instrs =
       match op with
       | "+" -> [ Mv (result_reg, e_reg) ]
@@ -539,7 +515,9 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
       | "!" -> [ Sltiu (result_reg, e_reg, 1) ]
       | _ -> failwith (Printf.sprintf "Unknown unary operator: %s" op)
     in
-    let release_instrs = release_temp_reg ctx e_reg in
+    
+    (* 只有在使用了新寄存器时才释放原寄存器 *)
+    let release_instrs = if release_e then release_temp_reg ctx e_reg else [] in
     result_reg, e_instrs @ spill_instrs @ op_instrs @ release_instrs
 
   | Ast.BinOp (e1, op, e2) ->
@@ -547,20 +525,30 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let e1_reg, e1_instrs = gen_expr ctx e1 in
     let e2_reg, e2_instrs = gen_expr ctx e2 in
     
-    (* 标记最近使用 *)
+    (* 标记寄存器最近使用 *)
     touch_reg ctx e1_reg;
     touch_reg ctx e2_reg;
     
     (* 优化：对于 commutative 操作，选择占用寄存器更久的作为第一个操作数 *)
-    let (rs1, rs2, instrs) = 
+    let (rs1, rs2) = 
       match op with
       | "+" | "*" | "&&" | "||" | "==" | "!=" ->
         (* 交换操作数可能带来更好的寄存器利用率 *)
-        (e2_reg, e1_reg, [])
-      | _ -> (e1_reg, e2_reg, [])
+        (e2_reg, e1_reg)
+      | _ -> (e1_reg, e2_reg)
     in
     
-    let result_reg, spill_instrs = get_temp_reg ctx in
+    (* 优化：对于赋值类操作，尝试复用第一个操作数的寄存器 *)
+    let result_reg, spill_instrs, release_rs1 =
+      match op with
+      | "+" | "-" | "*" | "/" | "%" ->
+        (* 这些操作可以安全复用第一个操作数寄存器 *)
+        rs1, [], false
+      | _ ->
+        let r, s = get_temp_reg ctx in
+        r, s, true
+    in
+    
     let op_instrs, temp_regs_used =
       match op with
       | "+" -> ([ Add (result_reg, rs1, rs2) ], [])
@@ -612,11 +600,11 @@ let rec gen_expr ctx (expr : Ast.expr) : reg * instruction list =
     let release_temp_instrs = 
       List.concat_map (fun reg -> release_temp_reg ctx reg) temp_regs_used in
     (* 释放操作数寄存器 *)
-    let release_e1_instrs = release_temp_reg ctx e1_reg in
-    let release_e2_instrs = release_temp_reg ctx e2_reg in
+    let release_rs1_instrs = if release_rs1 then release_temp_reg ctx rs1 else [] in
+    let release_rs2_instrs = release_temp_reg ctx rs2 in
     (* 组合所有指令 *)
-    let all_instrs = e1_instrs @ e2_instrs @ spill_instrs @ instrs @ 
-                     op_instrs @ release_temp_instrs @ release_e1_instrs @ release_e2_instrs in
+    let all_instrs = e1_instrs @ e2_instrs @ spill_instrs @ op_instrs @ 
+                     release_temp_instrs @ release_rs1_instrs @ release_rs2_instrs in
     result_reg, all_instrs
 
   | Ast.Call (fname, args) ->
@@ -709,7 +697,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let old_used_regs = !(ctx.used_regs) in
     let old_free_regs = !(ctx.free_regs) in
     let old_spill_stack = !(ctx.spill_stack) in
-    let old_timestamp = ctx.timestamp in
+    let old_var_reg_map = !(ctx.var_reg_map) in
     
     let items = List.map (gen_stmt ctx) stmts |> List.flatten in
     
@@ -722,7 +710,7 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     ctx.used_regs := old_used_regs;
     ctx.free_regs := old_free_regs;
     ctx.spill_stack := old_spill_stack;
-    ctx.timestamp <- old_timestamp;
+    ctx.var_reg_map := old_var_reg_map;
     
     items
   
@@ -746,37 +734,41 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let else_items = Option.value ~default:[] (Option.map (gen_stmt ctx) else_stmt) in
     let release_instrs = release_temp_reg ctx cond_reg in
     
-    (* 优化：使用相反的条件跳转减少分支数量 *)
+    (* 优化：如果条件为真则直接执行，减少跳转 *)
     let cond_jump = 
-      if List.length then_items > 3 then  (* 较长的then分支，优先跳转走 *)
-        Beq (cond_reg, Zero, else_label)
+      if List.length then_items > 0 then
+        [ Instruction (Beq (cond_reg, Zero, else_label)) ]
       else
-        Bne (cond_reg, Zero, end_label)  (* 较短的then分支，直接执行 *)
+        [ Instruction (Bne (cond_reg, Zero, end_label)) ]
     in
     
     List.map (fun i -> Instruction i) cond_instrs
-    @ [ Instruction cond_jump ]
+    @ cond_jump
     @ then_items
-    @ (if List.length then_items > 3 then [ Instruction (J end_label) ] else [])
-    @ [ Label else_label ]
+    @ (if Option.is_some else_stmt then [ Instruction (J end_label) ] else [])
+    @ (if Option.is_some else_stmt then [ Label else_label ] else [])
     @ else_items
     @ [ Label end_label ]
     @ List.map (fun i -> Instruction i) release_instrs
   
   | Ast.While (cond, body) ->
     let loop_label = new_label ctx "loop" in
-    let end_label = new_label ctx "endloop" in
+    let test_label = new_label ctx "test"
+    and end_label = new_label ctx "endloop" in
     ctx.break_labels <- end_label :: ctx.break_labels;
-    ctx.continue_labels <- loop_label :: ctx.continue_labels;
-    let cond_reg, cond_instrs = gen_expr ctx cond in
+    ctx.continue_labels <- test_label :: ctx.continue_labels;
+    
+    (* 优化：将条件测试放在循环末尾，减少一次跳转 *)
     let body_items = gen_stmt ctx body in
-    ctx.break_labels <- List.tl ctx.break_labels;
-    ctx.continue_labels <- List.tl ctx.continue_labels;
+    let cond_reg, cond_instrs = gen_expr ctx cond in
     let release_instrs = release_temp_reg ctx cond_reg in
     
-    (* 优化循环结构：将条件判断放在循环尾部减少一次跳转 *)
+    ctx.break_labels <- List.tl ctx.break_labels;
+    ctx.continue_labels <- List.tl ctx.continue_labels;
+    
     [ Label loop_label ]
     @ body_items
+    @ [ Label test_label ]
     @ List.map (fun i -> Instruction i) cond_instrs
     @ [ Instruction (Bne (cond_reg, Zero, loop_label)) ]
     @ [ Label end_label ]
@@ -797,6 +789,8 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let e_reg, e_instrs = gen_expr ctx e in
     (* 将函数调用结果存储到变量中 *)
     let store_instr = [ Sw (e_reg, Fp, offset) ] in
+    (* 将新变量添加到寄存器映射 *)
+    ctx.var_reg_map := (name, e_reg) :: !(ctx.var_reg_map);
     let release_instrs = release_temp_reg ctx e_reg in
     let all_instrs = e_instrs @ store_instr @ release_instrs in
     List.map (fun i -> Instruction i) all_instrs
@@ -806,6 +800,8 @@ let rec gen_stmt ctx (stmt : Ast.stmt) : asm_item list =
     let e_reg, e_instrs = gen_expr ctx e in
     (* 将函数调用结果赋值给变量 *)
     let store_instr = [ Sw (e_reg, Fp, offset) ] in
+    (* 更新变量-寄存器映射 *)
+    ctx.var_reg_map := (name, e_reg) :: List.filter (fun (n, _) -> n <> name) !(ctx.var_reg_map);
     let release_instrs = release_temp_reg ctx e_reg in
     let all_instrs = e_instrs @ store_instr @ release_instrs in
     List.map (fun i -> Instruction i) all_instrs
@@ -852,9 +848,6 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
   let ctx = create_context symbol_table func_def.fname frame_size 
       call_results_area_size ret_val_offset stack_args_offset spill_area_size in
   
-  (* 分析变量访问频率，为寄存器分配提供依据 *)
-  List.iter (analyze_stmt_frequency ctx) func_def.body;
-  
   (* 函数序言：一次性分配整个栈帧、设置fp并保存临时寄存器 *)
   let prologue = List.map (fun i -> Instruction i) (gen_prologue_instrs ctx frame_size) in
   
@@ -872,13 +865,19 @@ let gen_function symbol_table (func_def : Ast.func_def) : asm_item list =
              | 4 -> A4 | 5 -> A5 | 6 -> A6 | 7 -> A7
              | _ -> failwith "Invalid register index"
            in
+           (* 将参数添加到寄存器映射，以便直接访问 *)
+           ctx.var_reg_map := (name, arg_reg) :: !(ctx.var_reg_map);
            [ Instruction (Sw (arg_reg, Fp, param_offset)) ]
          else
            (* 第9+个参数从调用者栈参数区加载 (sp+0开始) *)
            let stack_arg_offset = ((i - 8) * 4) in  (* sp+0开始的偏移 *)
            let load_instr = Lw (T0, Fp, stack_arg_offset) in
            let store_instr = Sw (T0, Fp, param_offset) in
-           [ Instruction load_instr; Instruction store_instr ]
+           (* 将参数添加到寄存器映射 *)
+           ctx.var_reg_map := (name, T0) :: !(ctx.var_reg_map);
+           let release_instr = release_temp_reg ctx T0 in
+           [ Instruction load_instr; Instruction store_instr ] @ 
+           List.map (fun i -> Instruction i) release_instr
        in
        instr)
       func_def.params
@@ -933,12 +932,16 @@ let gen_program symbol_table (program : Ast.program) =
   @ List.flatten (List.map (gen_function symbol_table) program)
 
 
+
+
+
 let compile_to_riscv symbol_table program =
   let asm_items = gen_program symbol_table program in
   List.iter
     (fun item -> print_endline (asm_item_to_string item))
     asm_items
     
+
 
 
 
