@@ -401,9 +401,6 @@ let eliminate_dead_code program =
 (* 循环优化：循环不变量外提 (LICM) 和公共子表达式消除 (CSE)                  *)
 (*****************************************************************************)
 
-open Ast
-
-(* 变量集合操作 *)
 module VarMap = Map.Make(String)
 
 (* 辅助函数：判断表达式是否是变量 *)
@@ -560,10 +557,26 @@ end
 module ExprMap = Hashtbl.Make(ExprHash)
 
 (* 为表达式生成临时变量名 *)
-let fresh_cse_var counter =
+let fresh_cse_var func_name counter =
   let id = !counter in
   counter := id + 1;
-  "__cse_" ^ string_of_int id
+  "__cse_" ^ func_name ^ "_" ^ string_of_int id
+
+(* 跟踪当前作用域中的变量 *)
+let rec get_declared_vars stmt =
+  match stmt with
+  | Block stmts ->
+      List.fold_left (fun acc s -> VarSet.union acc (get_declared_vars s)) VarSet.empty stmts
+  | Decl (id, _) -> VarSet.singleton id
+  | If (_, then_s, else_s_opt) ->
+      let then_vars = get_declared_vars then_s in
+      let else_vars = match else_s_opt with
+        | Some s -> get_declared_vars s
+        | None -> VarSet.empty
+      in
+      VarSet.union then_vars else_vars
+  | While (_, body) -> get_declared_vars body
+  | _ -> VarSet.empty
 
 (* 替换表达式为临时变量 *)
 let rec replace_expr expr_map expr =
@@ -592,27 +605,31 @@ let rec replace_expr expr_map expr =
   | _ -> expr  (* 变量和常量不替换 *)
 
 (* 收集公共子表达式 *)
-let rec collect_common_subexprs expr_map counter expr =
+let rec collect_common_subexprs expr_map declared_vars func_name counter expr =
   match expr with
-  | BinOp (e1, op, e2) ->  (* 修复：捕获操作符op而不是使用_ *)
-      collect_common_subexprs expr_map counter e1;
-      collect_common_subexprs expr_map counter e2;
+  | BinOp (e1, op, e2) ->
+      collect_common_subexprs expr_map declared_vars func_name counter e1;
+      collect_common_subexprs expr_map declared_vars func_name counter e2;
       let e1' = replace_expr expr_map e1 in
       let e2' = replace_expr expr_map e2 in
-      let e = BinOp (e1', op, e2') in  (* 使用捕获的op *)
+      let e = BinOp (e1', op, e2') in
       if not (is_var e) && not (ExprMap.mem expr_map e) then
-        let var = fresh_cse_var counter in
+        let var = fresh_cse_var func_name counter in
+        (* 确保变量名不与已有变量冲突 *)
+        let var = if VarSet.mem var declared_vars then fresh_cse_var func_name counter else var in
         ExprMap.add expr_map e var
-  | UnOp (op, e) ->  (* 修复：捕获操作符op而不是使用_ *)
-      collect_common_subexprs expr_map counter e;
+  | UnOp (op, e) ->
+      collect_common_subexprs expr_map declared_vars func_name counter e;
       let e' = replace_expr expr_map e in
-      let e = UnOp (op, e') in  (* 使用捕获的op *)
+      let e = UnOp (op, e') in
       if not (is_var e) && not (ExprMap.mem expr_map e) then
-        let var = fresh_cse_var counter in
+        let var = fresh_cse_var func_name counter in
+        (* 确保变量名不与已有变量冲突 *)
+        let var = if VarSet.mem var declared_vars then fresh_cse_var func_name counter else var in
         ExprMap.add expr_map e var
   | Call (_, args) ->
-      List.iter (collect_common_subexprs expr_map counter) args
-  | Paren e -> collect_common_subexprs expr_map counter e
+      List.iter (collect_common_subexprs expr_map declared_vars func_name counter) args
+  | Paren e -> collect_common_subexprs expr_map declared_vars func_name counter e
   | _ -> ()  (* 变量和常量不处理 *)
 
 (* 替换语句中的公共子表达式 *)
@@ -640,10 +657,13 @@ let rec replace_common_subexprs expr_map stmt =
   | _ -> stmt  (* Break, Continue, Empty 不需要处理 *)
 
 (* 应用CSE到单个语句 *)
-let rec apply_cse stmt =
+let rec apply_cse func_name stmt =
   match stmt with
   | Block stmts ->
-      (* 1. 收集整个块中的公共子表达式 *)
+      (* 1. 收集当前作用域中已声明的变量 *)
+      let declared_vars = get_declared_vars (Block stmts) in
+      
+      (* 2. 收集整个块中的公共子表达式 *)
       let expr_map = ExprMap.create 100 in
       let counter = ref 0 in
       
@@ -651,38 +671,39 @@ let rec apply_cse stmt =
       let rec collect_all_exprs stmt =
         match stmt with
         | Block stmts -> List.iter collect_all_exprs stmts
-        | ExprStmt e | Assign (_, e) | Decl (_, e) -> collect_common_subexprs expr_map counter e
+        | ExprStmt e | Assign (_, e) | Decl (_, e) -> 
+            collect_common_subexprs expr_map declared_vars func_name counter e
         | If (e, s1, s2_opt) ->
-            collect_common_subexprs expr_map counter e;
+            collect_common_subexprs expr_map declared_vars func_name counter e;
             collect_all_exprs s1;
             Option.iter collect_all_exprs s2_opt
         | While (e, s) ->
-            collect_common_subexprs expr_map counter e;
+            collect_common_subexprs expr_map declared_vars func_name counter e;
             collect_all_exprs s
-        | Return (Some e) -> collect_common_subexprs expr_map counter e
+        | Return (Some e) -> collect_common_subexprs expr_map declared_vars func_name counter e
         | _ -> ()
       in
       List.iter collect_all_exprs stmts;
       
-      (* 2. 生成临时变量声明 *)
+      (* 3. 生成临时变量声明并确保它们在使用前被声明 *)
       let temp_decls = ExprMap.fold (fun e var acc ->
         Decl (var, e) :: acc
       ) expr_map [] in
       
-      (* 3. 替换公共子表达式 *)
+      (* 4. 替换公共子表达式 *)
       let replaced_stmts = List.map (replace_common_subexprs expr_map) stmts in
       
-      (* 4. 递归处理替换后的语句 *)
-      let optimized_stmts = List.map apply_cse replaced_stmts in
+      (* 5. 递归处理替换后的语句，将临时变量声明放在块的开头 *)
+      let optimized_stmts = List.map (apply_cse func_name) replaced_stmts in
       
       Block (temp_decls @ optimized_stmts)
       
   | While (cond, body) ->
       (* 对循环体单独应用CSE *)
-      While (cond, apply_cse body)
+      While (cond, apply_cse func_name body)
       
   | If (cond, then_s, else_s_opt) ->
-      If (cond, apply_cse then_s, Option.map apply_cse else_s_opt)
+      If (cond, apply_cse func_name then_s, Option.map (apply_cse func_name) else_s_opt)
       
   | _ -> stmt
 
@@ -694,7 +715,7 @@ let optimize_loops program =
       body = List.map (fun stmt ->
         stmt
         |> apply_licm    (* 先应用循环不变量外提 *)
-        |> apply_cse     (* 再应用公共子表达式消除 *)
+        |> apply_cse func.fname  (* 再应用公共子表达式消除，传入函数名用于生成唯一变量 *)
       ) func.body
     }
   ) program
