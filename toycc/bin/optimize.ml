@@ -1,5 +1,104 @@
 open Ast
 
+(*****************************************************************************)
+(* 尾递归优化 (TCO) - 新增部分                                               *)
+(*****************************************************************************)
+
+(* Helper to get the last element and the preceding elements of a list. *)
+let rec last_and_init = function
+  | [] -> failwith "Internal error: last_and_init called on an empty list"
+  | [x] -> (x, [])
+  | h :: t -> let (last, init) = last_and_init t in (last, h :: init)
+
+(* Scans a statement to see if it contains a tail-recursive call. *)
+let rec contains_tco_candidate (func: func_def) (is_tail_pos: bool) (stmt: stmt) : bool =
+  match stmt with
+  | Return (Some (Call(callee, args))) ->
+      is_tail_pos && callee = func.fname && List.length args = List.length func.params
+  
+  | If (_, then_s, else_s_opt) ->
+      let then_has = contains_tco_candidate func is_tail_pos then_s in
+      let else_has = match else_s_opt with
+        | Some else_s -> contains_tco_candidate func is_tail_pos else_s
+        | None -> false
+      in
+      then_has || else_has
+
+  | Block (stmts) ->
+      if not is_tail_pos || stmts = [] then
+        List.exists (contains_tco_candidate func false) stmts
+      else
+        let (last, init) = last_and_init stmts in
+        List.exists (contains_tco_candidate func false) init || contains_tco_candidate func true last
+
+  | While (_, body) -> 
+      contains_tco_candidate func false body
+  
+  | _ -> false
+
+(* Transforms a statement, converting tail-recursive calls into assignments and a continue. *)
+let rec transform_stmt_for_tco (func: func_def) (is_tail_pos: bool) (fresh_var_gen: unit -> id) (stmt: stmt) : stmt =
+  match stmt with
+  | Return (Some (Call(callee, args))) 
+    when is_tail_pos && callee = func.fname && List.length args = List.length func.params ->
+      let params = func.params in
+      let temp_decls_and_names = List.map (fun arg_expr ->
+        let temp_name = fresh_var_gen () in
+        (temp_name, Decl(temp_name, arg_expr))
+      ) args in
+      let temp_decls = List.map snd temp_decls_and_names in
+      let temp_names = List.map fst temp_decls_and_names in
+      let assignments = List.map2 (fun param temp_name ->
+        Assign(param.pname, Var temp_name)
+      ) params temp_names in
+      Block(temp_decls @ assignments @ [Continue])
+
+  | If (cond, then_s, else_s_opt) ->
+      let new_then = transform_stmt_for_tco func is_tail_pos fresh_var_gen then_s in
+      let new_else_opt = Option.map (transform_stmt_for_tco func is_tail_pos fresh_var_gen) else_s_opt in
+      If (cond, new_then, new_else_opt)
+
+  | Block (stmts) ->
+      if not is_tail_pos || stmts = [] then
+        Block (List.map (transform_stmt_for_tco func false fresh_var_gen) stmts)
+      else
+        let (last, init) = last_and_init stmts in
+        let transformed_init = List.map (transform_stmt_for_tco func false fresh_var_gen) init in
+        let transformed_last = transform_stmt_for_tco func true fresh_var_gen last in
+        Block(transformed_init @ [transformed_last])
+        
+  | While (cond, body) ->
+      While(cond, transform_stmt_for_tco func false fresh_var_gen body)
+
+  | _ -> stmt
+
+(* Main optimization function for a single function definition. *)
+let optimize_func_for_tco (func: func_def) : func_def =
+  let has_tco_candidate = List.exists (contains_tco_candidate func true) func.body in
+  
+  if not has_tco_candidate then
+    func
+  else
+    let counter = ref 0 in
+    let fresh_var_gen () =
+      counter := !counter + 1;
+      "__tco_" ^ func.fname ^ "_" ^ (string_of_int !counter)
+    in
+    let transformed_body_stmts = List.map (transform_stmt_for_tco func true fresh_var_gen) func.body in
+    let true_expr = Literal (IntLit 1) in
+    let loop_body = Block transformed_body_stmts in
+    let new_body = [While (true_expr, loop_body)] in
+    { func with body = new_body }
+
+(* Top-level entry point for the TCO pass. *)
+let optimize_tail_recursion (prog: program) : program =
+  List.map optimize_func_for_tco prog
+
+
+(*****************************************************************************)
+(* 您原有的优化代码                                                          *)
+(*****************************************************************************)
+
 (* 强化版常量折叠优化 *)
 let rec fold_constants_expr expr =
   match expr with
@@ -103,6 +202,7 @@ let is_const_false expr =
   | Literal (IntLit 0) -> true
   | _ -> false
 
+(* 移除不可达语句 *)
 let rec eliminate_dead_stmt reachable stmt =
   if not reachable then (None, false)
   else
@@ -162,6 +262,7 @@ and eliminate_dead_stmts reachable stmts =
       in
       (stmts', rest_reachable)
 
+(* 收集所有被使用的变量 *)
 let rec collect_vars_expr vars expr =
   match expr with
   | Literal _ -> vars
@@ -199,6 +300,7 @@ let rec collect_vars_stmt vars stmt =
       | None -> vars
       end
 
+(* 移除未使用的变量 *)
 let rec remove_unused_stmt used_vars stmt =
   match stmt with
   | Block stmts ->
@@ -247,6 +349,7 @@ and remove_unused_expr used_vars expr =
   | Paren e ->
       Paren (remove_unused_expr used_vars e)
 
+(* 简化空语句和空块 *)
 let rec simplify_empty_stmt stmt =
   match stmt with
   | Block stmts ->
@@ -269,147 +372,33 @@ let rec simplify_empty_stmt stmt =
       While (cond, body')
   | _ -> stmt
 
+(* 增强版死代码消除入口 *)
 let eliminate_dead_code program =
   List.map (fun func ->
+    (* 1. 第一次消除不可达语句 *)
     let body_reachable, _ = eliminate_dead_stmts true func.body in
+    (* 2. 第二次深度消除（处理嵌套块） *)
     let body_deep_reachable = 
       List.map (fun s -> 
         let s', _ = eliminate_dead_stmt true s in
         Option.value s' ~default:Empty
       ) body_reachable
     in
+    (* 3. 收集使用的变量 *)
     let used_vars = List.fold_left collect_vars_stmt VarSet.empty body_deep_reachable in
+    (* 4. 移除未使用的变量 *)
     let body_unused_removed = List.map (remove_unused_stmt used_vars) body_deep_reachable in
+    (* 5. 简化空语句 *)
     let body_simplified = List.map simplify_empty_stmt body_unused_removed in
     { func with body = body_simplified }
   ) program
 
+(*****************************************************************************)
+(* 最终的优化流水线                                                          *)
+(*****************************************************************************)
 
-(* 尾递归检测与转换为循环 *)
-let is_tail_recursive_call func_name params expr =
-  match expr with
-  | Return (Some (Call (fname, args))) when fname = func_name ->
-      (* 检查参数是否是简单表达式，不包含对自身的递归调用 *)
-      let rec is_simple_expr e =
-        match e with
-        | Literal _ | Var _ -> true
-        | BinOp (e1, _, e2) -> is_simple_expr e1 && is_simple_expr e2
-        | UnOp (_, e) -> is_simple_expr e
-        | Paren e -> is_simple_expr e
-        | Call (n, _) -> n <> func_name  (* 不允许嵌套调用自身 *)
-      in
-      List.for_all is_simple_expr args && 
-      List.length args = List.length params
-  | _ -> false
-
-let rec find_tail_recursive_return func_name params stmts =
-  match stmts with
-  | [] -> None
-  | stmt :: rest ->
-      match stmt with
-      | Return e when is_tail_recursive_call func_name params (Return e) ->
-          Some (Return e)
-      | Block b ->
-          begin match find_tail_recursive_return func_name params b with
-          | Some r -> Some r
-          | None -> find_tail_recursive_return func_name params rest
-          end
-      | If (_, then_stmt, Some else_stmt) ->
-          begin match find_tail_recursive_return func_name params [then_stmt] with
-          | Some r1 ->
-              begin match find_tail_recursive_return func_name params [else_stmt] with
-              | Some r2 -> Some (Block [r1; r2])  (* 两个分支都有尾递归 *)
-              | None -> None
-              end
-          | None -> find_tail_recursive_return func_name params [else_stmt]
-          end
-      | If (_, then_stmt, None) ->
-          find_tail_recursive_return func_name params [then_stmt]
-      | While (_, body) ->
-          (* 修复错误：将单个stmt包装成列表 [body] *)
-          begin match find_tail_recursive_return func_name params [body] with
-          | Some _ -> None  (* 循环内的尾递归不算 *)
-          | None -> find_tail_recursive_return func_name params rest
-          end
-      | _ -> find_tail_recursive_return func_name params rest
-
-(* 将尾递归转换为循环 *)
-let transform_tail_recursion func =
-  let func_name = func.fname in
-  let params = func.params in
-  
-  (* 检查是否存在尾递归返回语句 *)
-  match find_tail_recursive_return func_name params func.body with
-  | None -> func  (* 不是尾递归，不转换 *)
-  | Some tail_call ->
-      (* 从尾调用中提取参数 *)
-      let args = match tail_call with
-        | Return (Some (Call (_, args))) -> args
-        | Block [Return (Some (Call (_, args1))); Return (Some (Call (_, args2)))] ->
-            if args1 = args2 then args1 else args1  (* 取相同的参数列表 *)
-        | _ -> failwith "Invalid tail call structure"
-      in
-      
-      (* 创建参数赋值语句：将新参数值赋给原参数 *)
-      let param_assignments = 
-        List.map2 (fun param arg ->
-          Assign (param.pname, arg)
-        ) params args
-      in
-      
-      (* 创建循环条件：原函数的退出条件 *)
-      let exit_cond = 
-        If (
-          BinOp (Literal (IntLit 0), "==", Literal (IntLit 0)),  (* 初始为false *)
-          Return None,  (* 实际退出条件在原函数中 *)
-          None
-        )
-      in
-      
-      (* 构建循环体：原函数体(移除尾递归调用) + 参数重新赋值 + continue *)
-      let rec remove_tail_call stmt =
-        match stmt with
-        | Return e when is_tail_recursive_call func_name params (Return e) ->
-            Block (param_assignments @ [Continue])
-        | Block stmts ->
-            Block (List.map remove_tail_call stmts)
-        | If (cond, then_stmt, else_stmt_opt) ->
-            If (
-              cond,
-              remove_tail_call then_stmt,
-              Option.map remove_tail_call else_stmt_opt
-            )
-        | While (cond, body) ->
-            While (cond, remove_tail_call body)
-        | _ -> stmt
-      in
-      
-      let transformed_body = List.map remove_tail_call func.body in
-      
-      (* 创建初始参数声明 *)
-      let param_decls = 
-        List.map (fun param ->
-          Decl (param.pname, Var param.pname)  (* 保留原参数声明 *)
-        ) params
-      in
-      
-      (* 构建循环结构 *)
-      let loop_body = Block (transformed_body @ [exit_cond]) in
-      let while_loop = While (Literal (IntLit 1), loop_body) in  (* 始终为真的循环条件 *)
-      
-      (* 新函数体：参数声明 + 循环 *)
-      let new_body = param_decls @ [while_loop] in
-      
-      { func with body = new_body }
-
-let transform_tail_recursions program =
-  List.map transform_tail_recursion program
-
-
-(* 完整的优化流程 *)
 let optimize program =
   program 
-  |> fold_constants        (* 强化的常量折叠 *)
-  |> eliminate_dead_code   (* 强化的死代码消除 *)
-  |> transform_tail_recursions  (* 尾递归转循环 *)
-    
+  |> fold_constants       (* 1. 常量折叠 *)
+  |> eliminate_dead_code  (* 2. 死代码消除 *)
+  |> optimize_tail_recursion (* 3. 尾递归优化 (新增) *)
