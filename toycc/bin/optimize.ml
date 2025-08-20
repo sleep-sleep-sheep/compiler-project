@@ -105,10 +105,9 @@ let optimize_func_for_tco (func: func_def) : func_def =
     let new_body = [While (true_expr, loop_body)] in
     { func with body = new_body }
 
-(* 尾递归优化入口 *)
+(* 尾递归优化入口函数 *)
 let optimize_tail_recursion (prog: program) : program =
   List.map optimize_func_for_tco prog
-
 
 (*****************************************************************************)
 (* 强化版常量折叠优化                                                       *)
@@ -204,12 +203,164 @@ let fold_constants program =
     { func with body = List.map fold_constants_stmt func.body }
   ) program
 
+(*****************************************************************************)
+(* 循环优化：循环不变量外提                                                   *)
+(*****************************************************************************)
+
+module VarSet = Set.Make(String)
+
+(* 收集表达式中使用的变量 *)
+let rec expr_vars expr =
+  match expr with
+  | Literal _ -> VarSet.empty
+  | Var id -> VarSet.singleton id
+  | BinOp (e1, _, e2) -> VarSet.union (expr_vars e1) (expr_vars e2)
+  | UnOp (_, e) -> expr_vars e
+  | Call (_, args) -> List.fold_left (fun s e -> VarSet.union s (expr_vars e)) VarSet.empty args
+  | Paren e -> expr_vars e
+
+(* 收集语句中赋值的变量 *)
+let rec stmt_defs stmt =
+  match stmt with
+  | Block stmts -> List.fold_left (fun s stmt -> VarSet.union s (stmt_defs stmt)) VarSet.empty stmts
+  | Assign (id, _) -> VarSet.singleton id
+  | Decl (id, _) -> VarSet.singleton id
+  | If (_, then_stmt, else_stmt_opt) ->
+      let defs = stmt_defs then_stmt in
+      begin match else_stmt_opt with
+      | Some else_stmt -> VarSet.union defs (stmt_defs else_stmt)
+      | None -> defs
+      end
+  | While (_, body) -> stmt_defs body
+  | _ -> VarSet.empty  (* 其他语句不定义变量 *)
+
+(* 检查表达式是否是循环不变量 *)
+let is_invariant expr loop_defs =
+  let vars_used = expr_vars expr in
+  VarSet.disjoint vars_used loop_defs
+
+(* 检查语句是否是循环不变量 *)
+let is_invariant_stmt stmt loop_defs =
+  match stmt with
+  | Assign (id, expr) ->
+      is_invariant expr loop_defs && not (VarSet.mem id loop_defs)
+  | Decl (id, expr) ->
+      is_invariant expr loop_defs && not (VarSet.mem id loop_defs)
+  | ExprStmt expr -> is_invariant expr loop_defs
+  | _ -> false  (* 其他类型语句暂不视为循环不变量 *)
+
+(* 外提循环不变量 *)
+let rec hoist_invariants_stmt stmt =
+  match stmt with
+  | While (cond, body) ->
+      (* 计算循环体中定义的变量 *)
+      let loop_defs = stmt_defs body in
+      
+      (* 分离循环不变量和变体 *)
+      let rec separate_invariants stmts invariants variants =
+        match stmts with
+        | [] -> (List.rev invariants, List.rev variants)
+        | stmt::rest ->
+            if is_invariant_stmt stmt loop_defs then
+              separate_invariants rest (stmt::invariants) variants
+            else
+              separate_invariants rest invariants (stmt::variants)
+      in
+      
+      (* 处理循环体 *)
+      let body' = hoist_invariants_stmt body in
+      let invariants, variants = 
+        match body' with
+        | Block stmts -> separate_invariants stmts [] []
+        | _ -> separate_invariants [body'] [] []
+      in
+      
+      (* 创建新的循环体 *)
+      let new_body = if variants = [] then Empty else Block variants in
+      
+      (* 创建外提的不变量块和新循环 *)
+      if invariants = [] then
+        While (cond, new_body)
+      else
+        Block (invariants @ [While (cond, new_body)])
+  
+  | Block stmts ->
+      Block (List.map hoist_invariants_stmt stmts)
+      
+  | If (cond, then_stmt, else_stmt_opt) ->
+      let then_stmt' = hoist_invariants_stmt then_stmt in
+      let else_stmt_opt' = Option.map hoist_invariants_stmt else_stmt_opt in
+      If (cond, then_stmt', else_stmt_opt')
+      
+  | _ -> stmt  (* 其他语句不变 *)
+
+let hoist_loop_invariants program =
+  List.map (fun func ->
+    { func with body = List.map hoist_invariants_stmt func.body }
+  ) program
+
+(*****************************************************************************)
+(* 强度削弱                                                                   *)
+(*****************************************************************************)
+
+(* 强度削弱：将乘法转换为加法等 *)
+let rec strength_reduction_expr expr =
+  match expr with
+  | BinOp (e, "*", Literal (IntLit 2)) ->
+      (* x * 2 → x + x *)
+      BinOp (strength_reduction_expr e, "+", strength_reduction_expr e)
+  | BinOp (Literal (IntLit 2), "*", e) ->
+      (* 2 * x → x + x *)
+      BinOp (strength_reduction_expr e, "+", strength_reduction_expr e)
+  | BinOp (e, "*", Literal (IntLit 4)) ->
+      (* x * 4 → x + x + x + x *)
+      let e' = strength_reduction_expr e in
+      BinOp (BinOp (e', "+", e'), "+", BinOp (e', "+", e'))
+  | BinOp (e, "*", Literal (IntLit 8)) ->
+      (* x * 8 → x + x + x + x + x + x + x + x *)
+      let e' = strength_reduction_expr e in
+      let double = BinOp (e', "+", e') in
+      let quadruple = BinOp (double, "+", double) in
+      BinOp (quadruple, "+", quadruple)
+  | BinOp (e1, op, e2) ->
+      BinOp (strength_reduction_expr e1, op, strength_reduction_expr e2)
+  | UnOp (op, e) ->
+      UnOp (op, strength_reduction_expr e)
+  | Call (fname, args) ->
+      Call (fname, List.map strength_reduction_expr args)
+  | Paren e ->
+      Paren (strength_reduction_expr e)
+  | _ -> expr  (* 其他表达式不变 *)
+
+let rec strength_reduction_stmt stmt =
+  match stmt with
+  | Block stmts ->
+      Block (List.map strength_reduction_stmt stmts)
+  | ExprStmt expr ->
+      ExprStmt (strength_reduction_expr expr)
+  | Assign (id, expr) ->
+      Assign (id, strength_reduction_expr expr)
+  | Decl (id, expr) ->
+      Decl (id, strength_reduction_expr expr)
+  | If (cond, then_stmt, else_stmt_opt) ->
+      let cond' = strength_reduction_expr cond in
+      let then_stmt' = strength_reduction_stmt then_stmt in
+      let else_stmt_opt' = Option.map strength_reduction_stmt else_stmt_opt in
+      If (cond', then_stmt', else_stmt_opt')
+  | While (cond, body) ->
+      let cond' = strength_reduction_expr cond in
+      let body' = strength_reduction_stmt body in
+      While (cond', body')
+  | _ -> stmt  (* 其他语句不变 *)
+
+let strength_reduction program =
+  List.map (fun func ->
+    { func with body = List.map strength_reduction_stmt func.body }
+  ) program
 
 (*****************************************************************************)
 (* 增强版死代码消除                                                         *)
 (*****************************************************************************)
-
-module VarSet = Set.Make(String)
 
 let is_const_true expr =
   match expr with
@@ -418,8 +569,9 @@ let eliminate_dead_code program =
 
 let optimize program =
   program 
-  |> fold_constants        (* 1. 常量折叠 *)
-  |> eliminate_dead_code   (* 2. 死代码消除 *)
-  |> optimize_tail_recursion (* 3. 尾递归优化 *)
-
-
+  |> fold_constants                (* 1. 常量折叠 *)
+  |> eliminate_dead_code           (* 2. 死代码消除 *)
+  |> hoist_loop_invariants         (* 3. 循环不变量外提 *)
+  |> strength_reduction            (* 4. 强度削弱 *)
+  |> eliminate_dead_code           (* 5. 再次死代码消除，清理优化产生的冗余 *)
+  |> optimize_tail_recursion       (* 6. 尾递归优化 *)
