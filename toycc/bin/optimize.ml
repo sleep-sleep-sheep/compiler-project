@@ -1,24 +1,22 @@
 open Ast
 
 (*****************************************************************************)
-(* 尾递归优化 (TCO)                                                         *)
+(* 尾递归优化 (TCO) - 新增部分                                               *)
 (*****************************************************************************)
 
-(* 获取列表的最后一个元素和前面的元素 *)
+(* Helper to get the last element and the preceding elements of a list. *)
 let rec last_and_init = function
   | [] -> failwith "Internal error: last_and_init called on an empty list"
   | [x] -> (x, [])
   | h :: t -> let (last, init) = last_and_init t in (last, h :: init)
 
-(* 扫描语句，检查是否包含尾递归调用 *)
+(* Scans a statement to see if it contains a tail-recursive call. *)
 let rec contains_tco_candidate (func: func_def) (is_tail_pos: bool) (stmt: stmt) : bool =
   match stmt with
   | Return (Some (Call(callee, args))) ->
-      (* 如果在尾位置，且调用自身，参数数量匹配，则是尾递归候选 *)
       is_tail_pos && callee = func.fname && List.length args = List.length func.params
   
   | If (_, then_s, else_s_opt) ->
-      (* 检查if语句的两个分支 *)
       let then_has = contains_tco_candidate func is_tail_pos then_s in
       let else_has = match else_s_opt with
         | Some else_s -> contains_tco_candidate func is_tail_pos else_s
@@ -28,26 +26,21 @@ let rec contains_tco_candidate (func: func_def) (is_tail_pos: bool) (stmt: stmt)
 
   | Block (stmts) ->
       if not is_tail_pos || stmts = [] then
-        (* 非尾位置，检查任何语句是否有尾递归 *)
         List.exists (contains_tco_candidate func false) stmts
       else
-        (* 尾位置，只有最后一个语句可能是尾递归 *)
         let (last, init) = last_and_init stmts in
-        List.exists (contains_tco_candidate func false) init || 
-        contains_tco_candidate func true last
+        List.exists (contains_tco_candidate func false) init || contains_tco_candidate func true last
 
   | While (_, body) -> 
-      (* while循环体中没有尾位置 *)
       contains_tco_candidate func false body
   
   | _ -> false
 
-(* 转换语句，将尾递归调用转换为赋值和continue *)
+(* Transforms a statement, converting tail-recursive calls into assignments and a continue. *)
 let rec transform_stmt_for_tco (func: func_def) (is_tail_pos: bool) (fresh_var_gen: unit -> id) (stmt: stmt) : stmt =
   match stmt with
   | Return (Some (Call(callee, args))) 
     when is_tail_pos && callee = func.fname && List.length args = List.length func.params ->
-      (* 处理尾递归调用：将参数存储到临时变量，赋值给函数参数，然后continue *)
       let params = func.params in
       let temp_decls_and_names = List.map (fun arg_expr ->
         let temp_name = fresh_var_gen () in
@@ -61,59 +54,52 @@ let rec transform_stmt_for_tco (func: func_def) (is_tail_pos: bool) (fresh_var_g
       Block(temp_decls @ assignments @ [Continue])
 
   | If (cond, then_s, else_s_opt) ->
-      (* 转换if语句的两个分支 *)
       let new_then = transform_stmt_for_tco func is_tail_pos fresh_var_gen then_s in
       let new_else_opt = Option.map (transform_stmt_for_tco func is_tail_pos fresh_var_gen) else_s_opt in
       If (cond, new_then, new_else_opt)
 
   | Block (stmts) ->
       if not is_tail_pos || stmts = [] then
-        (* 非尾位置，转换所有语句 *)
         Block (List.map (transform_stmt_for_tco func false fresh_var_gen) stmts)
       else
-        (* 尾位置，只将最后一个语句视为尾位置 *)
         let (last, init) = last_and_init stmts in
         let transformed_init = List.map (transform_stmt_for_tco func false fresh_var_gen) init in
         let transformed_last = transform_stmt_for_tco func true fresh_var_gen last in
         Block(transformed_init @ [transformed_last])
         
   | While (cond, body) ->
-      (* 转换while循环体 *)
       While(cond, transform_stmt_for_tco func false fresh_var_gen body)
 
   | _ -> stmt
 
-(* 单个函数的尾递归优化 *)
+(* Main optimization function for a single function definition. *)
 let optimize_func_for_tco (func: func_def) : func_def =
-  (* 检查函数是否有尾递归调用 *)
   let has_tco_candidate = List.exists (contains_tco_candidate func true) func.body in
   
   if not has_tco_candidate then
-    func  (* 没有尾递归，直接返回 *)
+    func
   else
-    (* 生成新的变量名 *)
     let counter = ref 0 in
     let fresh_var_gen () =
       counter := !counter + 1;
       "__tco_" ^ func.fname ^ "_" ^ (string_of_int !counter)
     in
-    (* 转换函数体中的语句 *)
     let transformed_body_stmts = List.map (transform_stmt_for_tco func true fresh_var_gen) func.body in
-    (* 创建一个无限循环包裹转换后的代码 *)
-    let true_expr = Literal (IntLit 1) in  (* 非0值表示真 *)
+    let true_expr = Literal (IntLit 1) in
     let loop_body = Block transformed_body_stmts in
     let new_body = [While (true_expr, loop_body)] in
     { func with body = new_body }
 
-(* 尾递归优化入口 *)
+(* Top-level entry point for the TCO pass. *)
 let optimize_tail_recursion (prog: program) : program =
   List.map optimize_func_for_tco prog
 
 
 (*****************************************************************************)
-(* 强化版常量折叠优化                                                       *)
+(* 您原有的优化代码                                                          *)
 (*****************************************************************************)
 
+(* 强化版常量折叠优化 *)
 let rec fold_constants_expr expr =
   match expr with
   | Literal _ -> expr
@@ -129,7 +115,6 @@ let rec fold_constants_expr expr =
             | "*" -> n1 * n2
             | "/" -> n1 / n2
             | "%" -> n1 mod n2
-            (* 比较运算符支持 *)
             | "<" -> if n1 < n2 then 1 else 0
             | ">" -> if n1 > n2 then 1 else 0
             | "<=" -> if n1 <= n2 then 1 else 0
@@ -139,15 +124,14 @@ let rec fold_constants_expr expr =
             | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
           in
           Literal (IntLit result)
-      (* 扩展部分折叠规则集 *)
-      | e, Literal (IntLit 0) when op = "+" -> e  (* x + 0 → x *)
-      | Literal (IntLit 0), e when op = "+" -> e  (* 0 + x → x *)
-      | e, Literal (IntLit 0) when op = "-" -> e  (* x - 0 → x *)
-      | Literal (IntLit 0), e when op = "-" -> UnOp ("-", e)  (* 0 - x → -x *)
-      | Literal (IntLit 1), e when op = "*" -> e  (* 1 * x → x *)
-      | e, Literal (IntLit 1) when op = "*" -> e  (* x * 1 → x *)
-      | _, Literal (IntLit 0) when op = "*" -> Literal (IntLit 0)  (* x * 0 → 0 *)
-      | Literal (IntLit 0), _ when op = "*" -> Literal (IntLit 0)  (* 0 * x → 0 *)
+      | e, Literal (IntLit 0) when op = "+" -> e
+      | Literal (IntLit 0), e when op = "+" -> e
+      | e, Literal (IntLit 0) when op = "-" -> e
+      | Literal (IntLit 0), e when op = "-" -> UnOp ("-", e)
+      | Literal (IntLit 1), e when op = "*" -> e
+      | e, Literal (IntLit 1) when op = "*" -> e
+      | _, Literal (IntLit 0) when op = "*" -> Literal (IntLit 0)
+      | Literal (IntLit 0), _ when op = "*" -> Literal (IntLit 0)
       | _ -> BinOp (e1', op, e2')
       end
   | UnOp (op, e) ->
@@ -160,8 +144,8 @@ let rec fold_constants_expr expr =
             | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
           in
           Literal (IntLit result)
-      | UnOp ("!", e'') -> e''  (* !!x → x *)
-      | UnOp ("-", UnOp ("-", e'')) -> e''  (* -(-x) → x *)
+      | UnOp ("!", e'') -> e''
+      | UnOp ("-", UnOp ("-", e'')) -> e''
       | _ -> UnOp (op, e')
       end
   | Call (fname, args) ->
@@ -170,7 +154,7 @@ let rec fold_constants_expr expr =
   | Paren e ->
       let e' = fold_constants_expr e in
       begin match e' with
-      | Paren e'' -> e''  (* 移除嵌套括号 ((x)) → x *)
+      | Paren e'' -> e''
       | _ -> Paren e'
       end
 
@@ -205,10 +189,7 @@ let fold_constants program =
   ) program
 
 
-(*****************************************************************************)
-(* 增强版死代码消除                                                         *)
-(*****************************************************************************)
-
+(* 增强版死代码消除 *)
 module VarSet = Set.Make(String)
 
 let is_const_true expr =
@@ -413,11 +394,11 @@ let eliminate_dead_code program =
   ) program
 
 (*****************************************************************************)
-(* 最终的优化流水线                                                         *)
+(* 最终的优化流水线                                                          *)
 (*****************************************************************************)
 
 let optimize program =
   program 
-  |> fold_constants        (* 1. 常量折叠 *)
-  |> eliminate_dead_code   (* 2. 死代码消除 *)
-  |> optimize_tail_recursion (* 3. 尾递归优化 *)
+  |> fold_constants       (* 1. 常量折叠 *)
+  |> eliminate_dead_code  (* 2. 死代码消除 *)
+  |> optimize_tail_recursion (* 3. 尾递归优化 (新增) *)
