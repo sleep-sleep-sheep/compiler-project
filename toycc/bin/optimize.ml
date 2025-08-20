@@ -1,16 +1,16 @@
 open Ast
 
 (*****************************************************************************)
-(* 尾递归优化 (TCO) - 新增部分                                               *)
+(* 尾递归优化 (TCO)                                                          *)
 (*****************************************************************************)
 
-(* Helper to get the last element and the preceding elements of a list. *)
+(* 获取列表的最后一个元素和前面的元素 *)
 let rec last_and_init = function
   | [] -> failwith "Internal error: last_and_init called on an empty list"
   | [x] -> (x, [])
   | h :: t -> let (last, init) = last_and_init t in (last, h :: init)
 
-(* Scans a statement to see if it contains a tail-recursive call. *)
+(* 检查语句是否包含尾递归调用候选 *)
 let rec contains_tco_candidate (func: func_def) (is_tail_pos: bool) (stmt: stmt) : bool =
   match stmt with
   | Return (Some (Call(callee, args))) ->
@@ -36,7 +36,7 @@ let rec contains_tco_candidate (func: func_def) (is_tail_pos: bool) (stmt: stmt)
   
   | _ -> false
 
-(* Transforms a statement, converting tail-recursive calls into assignments and a continue. *)
+(* 转换语句，将尾递归调用转换为赋值和continue *)
 let rec transform_stmt_for_tco (func: func_def) (is_tail_pos: bool) (fresh_var_gen: unit -> id) (stmt: stmt) : stmt =
   match stmt with
   | Return (Some (Call(callee, args))) 
@@ -72,7 +72,7 @@ let rec transform_stmt_for_tco (func: func_def) (is_tail_pos: bool) (fresh_var_g
 
   | _ -> stmt
 
-(* Main optimization function for a single function definition. *)
+(* 单个函数的TCO优化 *)
 let optimize_func_for_tco (func: func_def) : func_def =
   let has_tco_candidate = List.exists (contains_tco_candidate func true) func.body in
   
@@ -90,16 +90,15 @@ let optimize_func_for_tco (func: func_def) : func_def =
     let new_body = [While (true_expr, loop_body)] in
     { func with body = new_body }
 
-(* Top-level entry point for the TCO pass. *)
+(* TCO优化入口 *)
 let optimize_tail_recursion (prog: program) : program =
   List.map optimize_func_for_tco prog
 
 
 (*****************************************************************************)
-(* 您原有的优化代码                                                          *)
+(* 常量折叠优化                                                              *)
 (*****************************************************************************)
 
-(* 强化版常量折叠优化 *)
 let rec fold_constants_expr expr =
   match expr with
   | Literal _ -> expr
@@ -189,7 +188,10 @@ let fold_constants program =
   ) program
 
 
-(* 增强版死代码消除 *)
+(*****************************************************************************)
+(* 死代码消除                                                                *)
+(*****************************************************************************)
+
 module VarSet = Set.Make(String)
 
 let is_const_true expr =
@@ -372,7 +374,7 @@ let rec simplify_empty_stmt stmt =
       While (cond, body')
   | _ -> stmt
 
-(* 增强版死代码消除入口 *)
+(* 死代码消除入口 *)
 let eliminate_dead_code program =
   List.map (fun func ->
     (* 1. 第一次消除不可达语句 *)
@@ -393,9 +395,7 @@ let eliminate_dead_code program =
     { func with body = body_simplified }
   ) program
 
-(*****************************************************************************)
-(* 最终的优化流水线                                                          *)
-(*****************************************************************************)
+
 (*****************************************************************************)
 (* 公共子表达式消除 (CSE)                                                    *)
 (*****************************************************************************)
@@ -531,8 +531,6 @@ let eliminate_common_subexprs (program: program) : program =
 (* 循环不变量外提 (LICM)                                                     *)
 (*****************************************************************************)
 
-(* 复用之前定义的VarSet *)
-
 (* 收集表达式中使用的变量 *)
 let rec vars_in_expr expr =
   match expr with
@@ -588,17 +586,18 @@ let rec extract_invariants (loop_vars: VarSet.t) (body_stmts: stmt list) =
         let (invars_from_rest, non_invars) = extract_invariants loop_vars rest in
         (invars_from_rest, stmt :: non_invars)
 
-(* 处理循环结构，外提不变量 *)
-let rec lift_loop_invariants (stmt: stmt) : stmt =
+(* 处理循环结构，外提不变量 (使用计数器生成唯一变量名) *)
+let rec lift_loop_invariants (counter: int ref) (stmt: stmt) : stmt =
   match stmt with
   | While (cond, body) ->
       (* 1. 分析循环体获取循环变量 *)
       let loop_vars = assigned_vars_in_stmt body in
       
-      (* 2. 分析循环条件是否为不变量 *)
+      (* 2. 分析循环条件是否为不变量，使用计数器生成唯一变量名 *)
       let (cond_invar, new_cond) = 
         if is_invariant loop_vars cond then
-          let temp = "__licm_cond_" ^ string_of_int (Random.int 10000) in
+          let temp = Printf.sprintf "__licm_cond_%d" !counter in
+          counter := !counter + 1;
           (Some (Decl (temp, cond)), Var temp)
         else
           (None, cond)
@@ -611,8 +610,8 @@ let rec lift_loop_invariants (stmt: stmt) : stmt =
       in
       let (invariants, remaining_body) = extract_invariants loop_vars body_stmts in
       
-      (* 4. 递归处理剩余语句中的循环 *)
-      let processed_body = List.map lift_loop_invariants remaining_body in
+      (* 4. 递归处理剩余语句中的循环，传递计数器 *)
+      let processed_body = List.map (lift_loop_invariants counter) remaining_body in
       
       (* 5. 重组循环结构 *)
       let new_body = Block processed_body in
@@ -625,18 +624,19 @@ let rec lift_loop_invariants (stmt: stmt) : stmt =
       else
         Block (pre_loop @ [While (new_cond, new_body)])
   
-  (* 递归处理嵌套结构 *)
+  (* 递归处理嵌套结构，传递计数器 *)
   | Block stmts ->
-      Block (List.map lift_loop_invariants stmts)
+      Block (List.map (lift_loop_invariants counter) stmts)
   | If (cond, then_stmt, else_opt) ->
-      let then' = lift_loop_invariants then_stmt in
-      let else' = Option.map lift_loop_invariants else_opt in
+      let then' = lift_loop_invariants counter then_stmt in
+      let else' = Option.map (lift_loop_invariants counter) else_opt in
       If (cond, then', else')
   | _ -> stmt  (* 其他语句不处理 *)
 
-(* 处理单个函数的LICM *)
+(* 处理单个函数的LICM，为每个函数创建独立计数器 *)
 let lift_invariant_code_func (func: func_def) : func_def =
-  { func with body = List.map lift_loop_invariants func.body }
+  let counter = ref 0 in  (* 为每个函数创建独立的计数器 *)
+  { func with body = List.map (lift_loop_invariants counter) func.body }
 
 (* 处理整个程序的LICM *)
 let lift_invariant_code (program: program) : program =
@@ -644,7 +644,7 @@ let lift_invariant_code (program: program) : program =
 
 
 (*****************************************************************************)
-(* 优化流水线更新                                                           *)
+(* 优化流水线                                                                *)
 (*****************************************************************************)
 
 let optimize program =
