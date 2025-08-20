@@ -105,6 +105,11 @@ let optimize_func_for_tco (func: func_def) : func_def =
     let new_body = [While (true_expr, loop_body)] in
     { func with body = new_body }
 
+(* 尾递归优化入口 *)
+let optimize_tail_recursion (prog: program) : program =
+  List.map optimize_func_for_tco prog
+
+
 (*****************************************************************************)
 (* 强化版常量折叠优化                                                       *)
 (*****************************************************************************)
@@ -143,8 +148,6 @@ let rec fold_constants_expr expr =
       | e, Literal (IntLit 1) when op = "*" -> e  (* x * 1 → x *)
       | _, Literal (IntLit 0) when op = "*" -> Literal (IntLit 0)  (* x * 0 → 0 *)
       | Literal (IntLit 0), _ when op = "*" -> Literal (IntLit 0)  (* 0 * x → 0 *)
-      | e1, BinOp(e2, "+", _) when e1 = e2 -> BinOp(e1, "*", Literal (IntLit 2))  (* x + x → 2*x *)
-      | BinOp(_, "+", e2), e3 when e2 = e3 -> BinOp(e2, "*", Literal (IntLit 2))  (* x + y + y → x + 2*y *)
       | _ -> BinOp (e1', op, e2')
       end
   | UnOp (op, e) ->
@@ -201,77 +204,6 @@ let fold_constants program =
     { func with body = List.map fold_constants_stmt func.body }
   ) program
 
-(*****************************************************************************)
-(* 循环优化                                                                 *)
-(*****************************************************************************)
-
-(* 检测并移除循环中的冗余计算 *)
-let rec remove_loop_redundancies_stmt stmt =
-  match stmt with
-  | While (cond, body) ->
-      (* 分析循环体，找出可以提升到循环外的计算 *)
-      let loop_invariants = find_loop_invariants body in
-      let body' = remove_invariants_from_body loop_invariants body in
-      (* 创建一个块，先执行不变量计算，再执行循环 *)
-      let invariant_decls = List.map (fun (id, expr) -> Decl(id, expr)) loop_invariants in
-      Block (invariant_decls @ [While (cond, body')])
-      
-  | Block stmts ->
-      Block (List.map remove_loop_redundancies_stmt stmts)
-      
-  | If (cond, then_stmt, else_stmt_opt) ->
-      let then_stmt' = remove_loop_redundancies_stmt then_stmt in
-      let else_stmt_opt' = Option.map remove_loop_redundancies_stmt else_stmt_opt in
-      If (cond, then_stmt', else_stmt_opt')
-      
-  | _ -> stmt
-
-(* 查找循环中的不变量表达式 *)
-and find_loop_invariants stmt =
-  (* 简单实现：查找不依赖循环变量的声明 *)
-  match stmt with
-  | Block stmts ->
-      List.filter_map (fun s ->
-        match s with
-        | Decl (id, expr) when not (depends_on_loop_vars expr) ->
-            Some (id, expr)
-        | _ -> None
-      ) stmts
-  | _ -> []
-
-(* 检查表达式是否依赖循环变量 *)
-and depends_on_loop_vars expr =
-  (* 简化实现：假设循环变量是常见的"i", "j", "k"等 *)
-  let loop_vars = ["i"; "j"; "k"; "x"; "y"; "z"] in
-  let rec check expr =
-    match expr with
-    | Var id -> List.mem id loop_vars
-    | BinOp (e1, _, e2) -> check e1 || check e2
-    | UnOp (_, e) -> check e
-    | Call (_, args) -> List.exists check args
-    | Paren e -> check e
-    | _ -> false
-  in
-  check expr
-
-(* 从循环体中移除已提升的不变量 *)
-and remove_invariants_from_body invariants body =
-  match body with
-  | Block stmts ->
-      let invariant_ids = List.map fst invariants in
-      let filtered_stmts = List.filter (fun s ->
-        match s with
-        | Decl (id, _) -> not (List.mem id invariant_ids)
-        | _ -> true
-      ) stmts in
-      Block (List.map (remove_loop_redundancies_stmt) filtered_stmts)
-  | _ -> remove_loop_redundancies_stmt body
-
-(* 循环优化入口 *)
-let optimize_loops program =
-  List.map (fun func ->
-    { func with body = List.map remove_loop_redundancies_stmt func.body }
-  ) program
 
 (*****************************************************************************)
 (* 增强版死代码消除                                                         *)
@@ -484,16 +416,10 @@ let eliminate_dead_code program =
 (* 最终的优化流水线                                                         *)
 (*****************************************************************************)
 
-let optimize_tail_recursion (prog: program) : program =
-  List.map optimize_func_for_tco prog
-
-
-
 let optimize program =
   program 
   |> fold_constants        (* 1. 常量折叠 *)
   |> eliminate_dead_code   (* 2. 死代码消除 *)
-  |> optimize_loops        (* 3. 循环优化 - 新增 *)
-  |> fold_constants        (* 4. 再次常量折叠 - 新增 *)
-  |> eliminate_dead_code   (* 5. 再次死代码消除 - 新增 *)
-  |> optimize_tail_recursion (* 6. 尾递归优化 *)
+  |> optimize_tail_recursion (* 3. 尾递归优化 *)
+
+
