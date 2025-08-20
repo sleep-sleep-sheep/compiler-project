@@ -16,7 +16,6 @@ let rec fold_constants_expr expr =
             | "*" -> n1 * n2
             | "/" -> n1 / n2
             | "%" -> n1 mod n2
-            (* 比较运算符支持 *)
             | "<" -> if n1 < n2 then 1 else 0
             | ">" -> if n1 > n2 then 1 else 0
             | "<=" -> if n1 <= n2 then 1 else 0
@@ -26,15 +25,14 @@ let rec fold_constants_expr expr =
             | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
           in
           Literal (IntLit result)
-      (* 扩展部分折叠规则集 *)
-      | e, Literal (IntLit 0) when op = "+" -> e  (* x + 0 → x *)
-      | Literal (IntLit 0), e when op = "+" -> e  (* 0 + x → x *)
-      | e, Literal (IntLit 0) when op = "-" -> e  (* x - 0 → x *)
-      | Literal (IntLit 0), e when op = "-" -> UnOp ("-", e)  (* 0 - x → -x *)
-      | Literal (IntLit 1), e when op = "*" -> e  (* 1 * x → x *)
-      | e, Literal (IntLit 1) when op = "*" -> e  (* x * 1 → x *)
-      | _, Literal (IntLit 0) when op = "*" -> Literal (IntLit 0)  (* x * 0 → 0 *)
-      | Literal (IntLit 0), _ when op = "*" -> Literal (IntLit 0)  (* 0 * x → 0 *)
+      | e, Literal (IntLit 0) when op = "+" -> e
+      | Literal (IntLit 0), e when op = "+" -> e
+      | e, Literal (IntLit 0) when op = "-" -> e
+      | Literal (IntLit 0), e when op = "-" -> UnOp ("-", e)
+      | Literal (IntLit 1), e when op = "*" -> e
+      | e, Literal (IntLit 1) when op = "*" -> e
+      | _, Literal (IntLit 0) when op = "*" -> Literal (IntLit 0)
+      | Literal (IntLit 0), _ when op = "*" -> Literal (IntLit 0)
       | _ -> BinOp (e1', op, e2')
       end
   | UnOp (op, e) ->
@@ -47,8 +45,8 @@ let rec fold_constants_expr expr =
             | _ -> failwith ("Unsupported operator for constant folding: " ^ op)
           in
           Literal (IntLit result)
-      | UnOp ("!", e'') -> e''  (* !!x → x *)
-      | UnOp ("-", UnOp ("-", e'')) -> e''  (* -(-x) → x *)
+      | UnOp ("!", e'') -> e''
+      | UnOp ("-", UnOp ("-", e'')) -> e''
       | _ -> UnOp (op, e')
       end
   | Call (fname, args) ->
@@ -57,7 +55,7 @@ let rec fold_constants_expr expr =
   | Paren e ->
       let e' = fold_constants_expr e in
       begin match e' with
-      | Paren e'' -> e''  (* 移除嵌套括号 ((x)) → x *)
+      | Paren e'' -> e''
       | _ -> Paren e'
       end
 
@@ -105,7 +103,6 @@ let is_const_false expr =
   | Literal (IntLit 0) -> true
   | _ -> false
 
-(* 移除不可达语句 *)
 let rec eliminate_dead_stmt reachable stmt =
   if not reachable then (None, false)
   else
@@ -165,7 +162,6 @@ and eliminate_dead_stmts reachable stmts =
       in
       (stmts', rest_reachable)
 
-(* 收集所有被使用的变量 *)
 let rec collect_vars_expr vars expr =
   match expr with
   | Literal _ -> vars
@@ -203,7 +199,6 @@ let rec collect_vars_stmt vars stmt =
       | None -> vars
       end
 
-(* 移除未使用的变量 *)
 let rec remove_unused_stmt used_vars stmt =
   match stmt with
   | Block stmts ->
@@ -252,7 +247,6 @@ and remove_unused_expr used_vars expr =
   | Paren e ->
       Paren (remove_unused_expr used_vars e)
 
-(* 简化空语句和空块 *)
 let rec simplify_empty_stmt stmt =
   match stmt with
   | Block stmts ->
@@ -275,29 +269,147 @@ let rec simplify_empty_stmt stmt =
       While (cond, body')
   | _ -> stmt
 
-(* 增强版死代码消除入口 *)
 let eliminate_dead_code program =
   List.map (fun func ->
-    (* 1. 第一次消除不可达语句 *)
     let body_reachable, _ = eliminate_dead_stmts true func.body in
-    (* 2. 第二次深度消除（处理嵌套块） *)
     let body_deep_reachable = 
       List.map (fun s -> 
         let s', _ = eliminate_dead_stmt true s in
         Option.value s' ~default:Empty
       ) body_reachable
     in
-    (* 3. 收集使用的变量 *)
     let used_vars = List.fold_left collect_vars_stmt VarSet.empty body_deep_reachable in
-    (* 4. 移除未使用的变量 *)
     let body_unused_removed = List.map (remove_unused_stmt used_vars) body_deep_reachable in
-    (* 5. 简化空语句 *)
     let body_simplified = List.map simplify_empty_stmt body_unused_removed in
     { func with body = body_simplified }
   ) program
 
-(* 完整的优化流程 - 不包含常量传播 *)
+
+(* 尾递归检测与转换为循环 *)
+let is_tail_recursive_call func_name params expr =
+  match expr with
+  | Return (Some (Call (fname, args))) when fname = func_name ->
+      (* 检查参数是否是简单表达式，不包含对自身的递归调用 *)
+      let rec is_simple_expr e =
+        match e with
+        | Literal _ | Var _ -> true
+        | BinOp (e1, _, e2) -> is_simple_expr e1 && is_simple_expr e2
+        | UnOp (_, e) -> is_simple_expr e
+        | Paren e -> is_simple_expr e
+        | Call (n, _) -> n <> func_name  (* 不允许嵌套调用自身 *)
+      in
+      List.for_all is_simple_expr args && 
+      List.length args = List.length params
+  | _ -> false
+
+let rec find_tail_recursive_return func_name params stmts =
+  match stmts with
+  | [] -> None
+  | stmt :: rest ->
+      match stmt with
+      | Return e when is_tail_recursive_call func_name params (Return e) ->
+          Some (Return e)
+      | Block b ->
+          begin match find_tail_recursive_return func_name params b with
+          | Some r -> Some r
+          | None -> find_tail_recursive_return func_name params rest
+          end
+      | If (_, then_stmt, Some else_stmt) ->
+          begin match find_tail_recursive_return func_name params [then_stmt] with
+          | Some r1 ->
+              begin match find_tail_recursive_return func_name params [else_stmt] with
+              | Some r2 -> Some (Block [r1; r2])  (* 两个分支都有尾递归 *)
+              | None -> None
+              end
+          | None -> find_tail_recursive_return func_name params [else_stmt]
+          end
+      | If (_, then_stmt, None) ->
+          find_tail_recursive_return func_name params [then_stmt]
+      | While (_, body) ->
+          (* 修复错误：将单个stmt包装成列表 [body] *)
+          begin match find_tail_recursive_return func_name params [body] with
+          | Some _ -> None  (* 循环内的尾递归不算 *)
+          | None -> find_tail_recursive_return func_name params rest
+          end
+      | _ -> find_tail_recursive_return func_name params rest
+
+(* 将尾递归转换为循环 *)
+let transform_tail_recursion func =
+  let func_name = func.fname in
+  let params = func.params in
+  
+  (* 检查是否存在尾递归返回语句 *)
+  match find_tail_recursive_return func_name params func.body with
+  | None -> func  (* 不是尾递归，不转换 *)
+  | Some tail_call ->
+      (* 从尾调用中提取参数 *)
+      let args = match tail_call with
+        | Return (Some (Call (_, args))) -> args
+        | Block [Return (Some (Call (_, args1))); Return (Some (Call (_, args2)))] ->
+            if args1 = args2 then args1 else args1  (* 取相同的参数列表 *)
+        | _ -> failwith "Invalid tail call structure"
+      in
+      
+      (* 创建参数赋值语句：将新参数值赋给原参数 *)
+      let param_assignments = 
+        List.map2 (fun param arg ->
+          Assign (param.pname, arg)
+        ) params args
+      in
+      
+      (* 创建循环条件：原函数的退出条件 *)
+      let exit_cond = 
+        If (
+          BinOp (Literal (IntLit 0), "==", Literal (IntLit 0)),  (* 初始为false *)
+          Return None,  (* 实际退出条件在原函数中 *)
+          None
+        )
+      in
+      
+      (* 构建循环体：原函数体(移除尾递归调用) + 参数重新赋值 + continue *)
+      let rec remove_tail_call stmt =
+        match stmt with
+        | Return e when is_tail_recursive_call func_name params (Return e) ->
+            Block (param_assignments @ [Continue])
+        | Block stmts ->
+            Block (List.map remove_tail_call stmts)
+        | If (cond, then_stmt, else_stmt_opt) ->
+            If (
+              cond,
+              remove_tail_call then_stmt,
+              Option.map remove_tail_call else_stmt_opt
+            )
+        | While (cond, body) ->
+            While (cond, remove_tail_call body)
+        | _ -> stmt
+      in
+      
+      let transformed_body = List.map remove_tail_call func.body in
+      
+      (* 创建初始参数声明 *)
+      let param_decls = 
+        List.map (fun param ->
+          Decl (param.pname, Var param.pname)  (* 保留原参数声明 *)
+        ) params
+      in
+      
+      (* 构建循环结构 *)
+      let loop_body = Block (transformed_body @ [exit_cond]) in
+      let while_loop = While (Literal (IntLit 1), loop_body) in  (* 始终为真的循环条件 *)
+      
+      (* 新函数体：参数声明 + 循环 *)
+      let new_body = param_decls @ [while_loop] in
+      
+      { func with body = new_body }
+
+let transform_tail_recursions program =
+  List.map transform_tail_recursion program
+
+
+(* 完整的优化流程 *)
 let optimize program =
   program 
   |> fold_constants        (* 强化的常量折叠 *)
   |> eliminate_dead_code   (* 强化的死代码消除 *)
+  |> transform_tail_recursions  (* 尾递归转循环 *)
+    
