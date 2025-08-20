@@ -1,16 +1,16 @@
 open Ast
 
 (*****************************************************************************)
-(* 尾递归优化 (TCO)                                                          *)
+(* 尾递归优化 (TCO) - 新增部分                                               *)
 (*****************************************************************************)
 
-(* 获取列表的最后一个元素和前面的元素 *)
+(* Helper to get the last element and the preceding elements of a list. *)
 let rec last_and_init = function
   | [] -> failwith "Internal error: last_and_init called on an empty list"
   | [x] -> (x, [])
   | h :: t -> let (last, init) = last_and_init t in (last, h :: init)
 
-(* 检查语句是否包含尾递归调用候选 *)
+(* Scans a statement to see if it contains a tail-recursive call. *)
 let rec contains_tco_candidate (func: func_def) (is_tail_pos: bool) (stmt: stmt) : bool =
   match stmt with
   | Return (Some (Call(callee, args))) ->
@@ -36,7 +36,7 @@ let rec contains_tco_candidate (func: func_def) (is_tail_pos: bool) (stmt: stmt)
   
   | _ -> false
 
-(* 转换语句，将尾递归调用转换为赋值和continue *)
+(* Transforms a statement, converting tail-recursive calls into assignments and a continue. *)
 let rec transform_stmt_for_tco (func: func_def) (is_tail_pos: bool) (fresh_var_gen: unit -> id) (stmt: stmt) : stmt =
   match stmt with
   | Return (Some (Call(callee, args))) 
@@ -72,7 +72,7 @@ let rec transform_stmt_for_tco (func: func_def) (is_tail_pos: bool) (fresh_var_g
 
   | _ -> stmt
 
-(* 单个函数的TCO优化 *)
+(* Main optimization function for a single function definition. *)
 let optimize_func_for_tco (func: func_def) : func_def =
   let has_tco_candidate = List.exists (contains_tco_candidate func true) func.body in
   
@@ -90,15 +90,16 @@ let optimize_func_for_tco (func: func_def) : func_def =
     let new_body = [While (true_expr, loop_body)] in
     { func with body = new_body }
 
-(* TCO优化入口 *)
+(* Top-level entry point for the TCO pass. *)
 let optimize_tail_recursion (prog: program) : program =
   List.map optimize_func_for_tco prog
 
 
 (*****************************************************************************)
-(* 常量折叠优化                                                              *)
+(* 您原有的优化代码                                                          *)
 (*****************************************************************************)
 
+(* 强化版常量折叠优化 *)
 let rec fold_constants_expr expr =
   match expr with
   | Literal _ -> expr
@@ -188,10 +189,7 @@ let fold_constants program =
   ) program
 
 
-(*****************************************************************************)
-(* 死代码消除                                                                *)
-(*****************************************************************************)
-
+(* 增强版死代码消除 *)
 module VarSet = Set.Make(String)
 
 let is_const_true expr =
@@ -374,7 +372,7 @@ let rec simplify_empty_stmt stmt =
       While (cond, body')
   | _ -> stmt
 
-(* 死代码消除入口 *)
+(* 增强版死代码消除入口 *)
 let eliminate_dead_code program =
   List.map (fun func ->
     (* 1. 第一次消除不可达语句 *)
@@ -395,6 +393,9 @@ let eliminate_dead_code program =
     { func with body = body_simplified }
   ) program
 
+(*****************************************************************************)
+(* 最终的优化流水线                                                          *)
+(*****************************************************************************)
 
 (*****************************************************************************)
 (* 公共子表达式消除 (CSE)                                                    *)
@@ -405,126 +406,156 @@ module ExprMap = Map.Make(struct
   let compare = compare
 end)
 
-(* 收集表达式出现次数，识别公共子表达式 *)
-let rec count_expr_occurrences expr counts =
-  let counts = ExprMap.update expr 
-    (fun cnt -> Some (1 + match cnt with Some c -> c | None -> 0)) counts in
+module ExprSet = Set.Make(struct
+  type t = expr
+  let compare = compare
+end)
+
+(* 收集表达式中所有的子表达式 *)
+let rec collect_subexpressions expr =
+  let subexprs = ExprSet.singleton expr in
   match expr with
+  | Literal _ | Var _ -> subexprs
   | BinOp (e1, _, e2) ->
-      let counts = count_expr_occurrences e1 counts in
-      count_expr_occurrences e2 counts
-  | UnOp (_, e) -> count_expr_occurrences e counts
+      let s1 = collect_subexpressions e1 in
+      let s2 = collect_subexpressions e2 in
+      ExprSet.union (ExprSet.union s1 s2) subexprs
+  | UnOp (_, e) ->
+      let s = collect_subexpressions e in
+      ExprSet.union s subexprs
   | Call (_, args) ->
-      List.fold_left (fun counts e -> count_expr_occurrences e counts) counts args
-  | Paren e -> count_expr_occurrences e counts
-  | _ -> counts  (* 变量和常量不参与CSE *)
-
-let rec count_stmt_exprs stmt counts =
-  match stmt with
-  | Block stmts -> 
-      List.fold_left (fun acc s -> count_stmt_exprs s acc) counts stmts
-  | ExprStmt e -> 
-      count_expr_occurrences e counts
-  | Assign (_, e) -> 
-      count_expr_occurrences e counts
-  | Decl (_, e) -> 
-      count_expr_occurrences e counts
-  | If (cond, then_stmt, else_opt) ->
-      let counts = count_expr_occurrences cond counts in
-      let counts = count_stmt_exprs then_stmt counts in
-      (match else_opt with
-       | Some s -> count_stmt_exprs s counts
-       | None -> counts)
-  | While (cond, body) ->
-      let counts = count_expr_occurrences cond counts in
-      count_stmt_exprs body counts
-  | Return (Some e) -> 
-      count_expr_occurrences e counts
-  | _ -> counts  (* 空语句、break、continue等无表达式 *)
-
-(* 替换公共子表达式为临时变量 *)
-let rec replace_common_exprs (expr_map: id ExprMap.t) expr =
-  match expr with
-  | BinOp (e1, op, e2) ->
-      let e1' = replace_common_exprs expr_map e1 in
-      let e2' = replace_common_exprs expr_map e2 in
-      let new_expr = BinOp (e1', op, e2') in
-      (match ExprMap.find_opt new_expr expr_map with
-       | Some id -> Var id
-       | None -> new_expr)
-  | UnOp (op, e) ->
-      let e' = replace_common_exprs expr_map e in
-      let new_expr = UnOp (op, e') in
-      (match ExprMap.find_opt new_expr expr_map with
-       | Some id -> Var id
-       | None -> new_expr)
-  | Call (fname, args) ->
-      let args' = List.map (replace_common_exprs expr_map) args in
-      Call (fname, args')
+      let s = List.fold_left (fun acc e ->
+        ExprSet.union acc (collect_subexpressions e)
+      ) ExprSet.empty args in
+      ExprSet.union s subexprs
   | Paren e ->
-      let e' = replace_common_exprs expr_map e in
-      Paren e'
-  | _ -> expr  (* 变量和常量不替换 *)
+      let s = collect_subexpressions e in
+      ExprSet.union s subexprs
 
-let rec replace_common_in_stmt expr_map stmt =
+(* 计算表达式出现的次数 *)
+let count_subexpression_occurrences expr =
+  let subexprs = collect_subexpressions expr in
+  ExprSet.fold (fun e acc ->
+    let count = ref 0 in
+    let rec count_occurrences e target =
+      if e = target then incr count;
+      match e with
+      | Literal _ | Var _ -> ()
+      | BinOp (e1, _, e2) ->
+          count_occurrences e1 target;
+          count_occurrences e2 target
+      | UnOp (_, e) -> count_occurrences e target
+      | Call (_, args) -> List.iter (fun a -> count_occurrences a target) args
+      | Paren e -> count_occurrences e target
+    in
+    count_occurrences expr e;
+    ExprMap.add e !count acc
+  ) subexprs ExprMap.empty
+
+(* 替换表达式中的子表达式 *)
+let rec replace_subexpr expr target replacement =
+  if expr = target then replacement
+  else
+    match expr with
+    | Literal _ | Var _ -> expr
+    | BinOp (e1, op, e2) ->
+        BinOp (replace_subexpr e1 target replacement, op, replace_subexpr e2 target replacement)
+    | UnOp (op, e) ->
+        UnOp (op, replace_subexpr e target replacement)
+    | Call (fname, args) ->
+        Call (fname, List.map (fun a -> replace_subexpr a target replacement) args)
+    | Paren e ->
+        Paren (replace_subexpr e target replacement)
+
+(* 对表达式应用CSE *)
+let rec cse_expr (counter: int ref) (expr: expr) : expr * stmt list =
+  let occurrences = count_subexpression_occurrences expr in
+  
+  (* 找到出现次数超过1次的复杂子表达式（不是简单变量或字面量） *)
+  let candidates = ExprMap.fold (fun e count acc ->
+    match e with
+    | Literal _ | Var _ -> acc  (* 跳过简单表达式 *)
+    | _ when count > 1 -> e :: acc
+    | _ -> acc
+  ) occurrences [] in
+  
+  (* 按表达式复杂度排序，先处理更复杂的表达式 *)
+  let sorted_candidates = List.sort (fun e1 e2 ->
+    let size1 = ExprSet.cardinal (collect_subexpressions e1) in
+    let size2 = ExprSet.cardinal (collect_subexpressions e2) in
+    compare size2 size1  (* 降序排序 *)
+  ) candidates in
+  
+  match sorted_candidates with
+  | [] -> (expr, [])
+  | candidate :: _ ->
+      (* 创建新的临时变量 *)
+      counter := !counter + 1;
+      let temp_var = "__cse_" ^ string_of_int !counter in
+      
+      (* 递归处理候选表达式本身 *)
+      let simplified_candidate, decls1 = cse_expr counter candidate in
+      
+      (* 用临时变量替换原表达式中的候选子表达式 *)
+      let new_expr = replace_subexpr expr candidate (Var temp_var) in
+      
+      (* 递归处理新表达式 *)
+      let simplified_expr, decls2 = cse_expr counter new_expr in
+      
+      (* 创建临时变量声明 *)
+      let temp_decl = Decl (temp_var, simplified_candidate) in
+      
+      (simplified_expr, decls1 @ [temp_decl] @ decls2)
+
+(* 对语句应用CSE *)
+let rec cse_stmt (counter: int ref) (stmt: stmt) : stmt =
   match stmt with
   | Block stmts ->
-      Block (List.map (replace_common_in_stmt expr_map) stmts)
-  | ExprStmt e ->
-      ExprStmt (replace_common_exprs expr_map e)
-  | Assign (id, e) ->
-      Assign (id, replace_common_exprs expr_map e)
-  | Decl (id, e) ->
-      Decl (id, replace_common_exprs expr_map e)
-  | If (cond, then_stmt, else_opt) ->
-      let cond' = replace_common_exprs expr_map cond in
-      let then' = replace_common_in_stmt expr_map then_stmt in
-      let else' = Option.map (replace_common_in_stmt expr_map) else_opt in
-      If (cond', then', else')
+      (* 使用List.map和List.flatten替代List.flat_map以兼容旧版本OCaml *)
+      let new_stmts = List.flatten (List.map (fun s ->
+        match cse_stmt counter s with
+        | Block bs -> bs
+        | s' -> [s']
+      ) stmts) in
+      Block new_stmts
+  | Empty -> Empty
+  | ExprStmt expr ->
+      let simplified_expr, decls = cse_expr counter expr in
+      Block (decls @ [ExprStmt simplified_expr])
+  | Assign (id, expr) ->
+      let simplified_expr, decls = cse_expr counter expr in
+      Block (decls @ [Assign (id, simplified_expr)])
+  | Decl (id, expr) ->
+      let simplified_expr, decls = cse_expr counter expr in
+      Block (decls @ [Decl (id, simplified_expr)])
+  | If (cond, then_stmt, else_stmt_opt) ->
+      let simplified_cond, decls = cse_expr counter cond in
+      let new_then = cse_stmt counter then_stmt in
+      let new_else_opt = Option.map (cse_stmt counter) else_stmt_opt in
+      Block (decls @ [If (simplified_cond, new_then, new_else_opt)])
   | While (cond, body) ->
-      let cond' = replace_common_exprs expr_map cond in
-      let body' = replace_common_in_stmt expr_map body in
-      While (cond', body')
-  | Return (Some e) ->
-      Return (Some (replace_common_exprs expr_map e))
-  | _ -> stmt  (* 其他语句无需处理 *)
+      let simplified_cond, decls = cse_expr counter cond in
+      let new_body = cse_stmt counter body in
+      Block (decls @ [While (simplified_cond, new_body)])
+  | Break -> Break
+  | Continue -> Continue
+  | Return expr_opt ->
+      let new_expr_opt, decls = match expr_opt with
+        | Some expr ->
+            let e, d = cse_expr counter expr in
+            (Some e, d)
+        | None -> (None, [])
+      in
+      Block (decls @ [Return new_expr_opt])
 
-(* 处理单个函数的CSE *)
-let eliminate_common_subexprs_func (func: func_def) : func_def =
-  (* 1. 收集所有表达式及其出现次数 *)
-  let expr_counts = List.fold_left (fun acc s -> count_stmt_exprs s acc) ExprMap.empty func.body in
-  
-  (* 2. 筛选出现次数≥2的表达式作为公共子表达式 *)
-  let common_exprs = ExprMap.filter (fun _ cnt -> cnt >= 2) expr_counts in
-  
-  if ExprMap.is_empty common_exprs then
-    func
-  else
-    (* 3. 为每个公共子表达式生成临时变量 *)
-    let counter = ref 0 in
-    let fresh_var () = 
-      counter := !counter + 1;
-      "__cse_" ^ func.fname ^ "_" ^ string_of_int !counter
-    in
-    let (temp_decls, expr_map) = 
-      ExprMap.fold (fun expr _ (decls, map) ->
-        let var = fresh_var () in
-        (Decl (var, expr) :: decls, ExprMap.add expr var map)
-      ) common_exprs ([], ExprMap.empty)
-    in
-    
-    (* 4. 替换函数体中的公共子表达式 *)
-    let new_body = 
-      temp_decls @ List.map (replace_common_in_stmt expr_map) func.body 
-      |> fun stmts -> Block stmts  (* 包装成块语句 *)
-      |> fun block -> [block]  (* 还原为语句列表 *)
-    in
-    
-    { func with body = new_body }
+(* 对函数应用CSE *)
+let cse_func (func: func_def) : func_def =
+  let counter = ref 0 in
+  { func with body = List.map (cse_stmt counter) func.body }
 
-(* 处理整个程序的CSE *)
-let eliminate_common_subexprs (program: program) : program =
-  List.map eliminate_common_subexprs_func program
+(* CSE优化入口 *)
+let eliminate_common_subexpressions (program: program) : program =
+  List.map cse_func program
 
 
 (*****************************************************************************)
@@ -532,125 +563,220 @@ let eliminate_common_subexprs (program: program) : program =
 (*****************************************************************************)
 
 (* 收集表达式中使用的变量 *)
-let rec vars_in_expr expr =
+let rec get_vars expr =
   match expr with
+  | Literal _ -> VarSet.empty
   | Var id -> VarSet.singleton id
-  | BinOp (e1, _, e2) ->
-      VarSet.union (vars_in_expr e1) (vars_in_expr e2)
-  | UnOp (_, e) -> vars_in_expr e
+  | BinOp (e1, _, e2) -> VarSet.union (get_vars e1) (get_vars e2)
+  | UnOp (_, e) -> get_vars e
   | Call (_, args) ->
-      List.fold_left (fun acc e -> VarSet.union acc (vars_in_expr e)) VarSet.empty args
-  | Paren e -> vars_in_expr e
-  | _ -> VarSet.empty  (* 常量无变量 *)
+      List.fold_left (fun acc e -> VarSet.union acc (get_vars e)) VarSet.empty args
+  | Paren e -> get_vars e
 
-(* 收集语句中赋值的变量 *)
-let rec assigned_vars_in_stmt stmt =
+(* 收集语句中赋值或声明的变量 *)
+let rec get_assigned_vars stmt =
   match stmt with
+  | Block stmts ->
+      List.fold_left (fun acc s -> VarSet.union acc (get_assigned_vars s)) VarSet.empty stmts
   | Assign (id, _) -> VarSet.singleton id
   | Decl (id, _) -> VarSet.singleton id
-  | Block stmts ->
-      List.fold_left (fun acc s -> VarSet.union acc (assigned_vars_in_stmt s)) VarSet.empty stmts
-  | If (_, then_stmt, else_opt) ->
-      let then_vars = assigned_vars_in_stmt then_stmt in
-      let else_vars = match else_opt with
-        | Some s -> assigned_vars_in_stmt s
+  | If (_, then_stmt, else_stmt_opt) ->
+      let then_vars = get_assigned_vars then_stmt in
+      let else_vars = match else_stmt_opt with
+        | Some s -> get_assigned_vars s
         | None -> VarSet.empty
       in
       VarSet.union then_vars else_vars
-  | While (_, body) -> assigned_vars_in_stmt body
-  | _ -> VarSet.empty  (* 其他语句不赋值变量 *)
+  | While (_, body) -> get_assigned_vars body
+  | _ -> VarSet.empty  (* 其他语句不改变变量集 *)
 
-(* 判断表达式是否为循环不变量 *)
-let is_invariant (loop_vars: VarSet.t) (expr: expr) : bool =
-  let expr_vars = vars_in_expr expr in
+(* 检查表达式是否是循环不变量 *)
+let is_invariant expr loop_vars =
+  let expr_vars = get_vars expr in
   VarSet.disjoint expr_vars loop_vars
 
-(* 判断语句是否为循环不变量且可外提 *)
-let is_stmt_invariant (loop_vars: VarSet.t) (stmt: stmt) : bool =
+(* 重写表达式中的变量，替换为外提的临时变量 *)
+let rec rewrite_expr expr var_map =
+  match expr with
+  | Var id ->
+      (match VarSet.find_opt id var_map with
+       | Some temp -> Var temp
+       | None -> expr)
+  | BinOp (e1, op, e2) ->
+      BinOp (rewrite_expr e1 var_map, op, rewrite_expr e2 var_map)
+  | UnOp (op, e) ->
+      UnOp (op, rewrite_expr e var_map)
+  | Call (fname, args) ->
+      Call (fname, List.map (fun e -> rewrite_expr e var_map) args)
+  | Paren e ->
+      Paren (rewrite_expr e var_map)
+  | _ -> expr  (* 字面量不变 *)
+
+(* 重写语句中的变量，替换为外提的临时变量 *)
+let rec rewrite_stmt stmt var_map =
   match stmt with
-  | Decl (id, expr) ->
-      is_invariant loop_vars expr && not (VarSet.mem id loop_vars)
+  | Block stmts ->
+      Block (List.map (fun s -> rewrite_stmt s var_map) stmts)
+  | ExprStmt expr ->
+      ExprStmt (rewrite_expr expr var_map)
   | Assign (id, expr) ->
-      is_invariant loop_vars expr && not (VarSet.mem id loop_vars)
-  | _ -> false  (* 仅处理变量声明和赋值语句 *)
+      Assign (id, rewrite_expr expr var_map)
+  | Decl (id, expr) ->
+      Decl (id, rewrite_expr expr var_map)
+  | If (cond, then_stmt, else_stmt_opt) ->
+      If (rewrite_expr cond var_map,
+          rewrite_stmt then_stmt var_map,
+          Option.map (fun s -> rewrite_stmt s var_map) else_stmt_opt)
+  | While (cond, body) ->
+      While (rewrite_expr cond var_map, rewrite_stmt body var_map)
+  | Return expr_opt ->
+      Return (Option.map (fun e -> rewrite_expr e var_map) expr_opt)
+  | _ -> stmt  (* Break, Continue, Empty不变 *)
 
-(* 提取循环不变量 *)
-let rec extract_invariants (loop_vars: VarSet.t) (body_stmts: stmt list) =
-  match body_stmts with
-  | [] -> ([], [])
-  | stmt :: rest ->
-      if is_stmt_invariant loop_vars stmt then
-        let (invars, rest_invars) = extract_invariants loop_vars rest in
-        (stmt :: invars, rest_invars)
-      else
-        let (invars_from_rest, non_invars) = extract_invariants loop_vars rest in
-        (invars_from_rest, stmt :: non_invars)
+(* 提取循环不变量表达式 *)
+let rec extract_invariants (counter: int ref) loop_vars stmt =
+  match stmt with
+  | Block stmts ->
+      let invariant_decls = ref [] in
+      let var_map = ref VarSet.empty in
+      let new_stmts = List.map (fun s ->
+        let invars, vars, s' = extract_invariants counter loop_vars s in
+        invariant_decls := !invariant_decls @ invars;
+        var_map := VarSet.union !var_map vars;
+        rewrite_stmt s' !var_map
+      ) stmts in
+      (!invariant_decls, !var_map, Block new_stmts)
+  
+  | ExprStmt expr when is_invariant expr loop_vars ->
+      (* 提取表达式不变量 *)
+      counter := !counter + 1;
+      let temp_var = "__licm_" ^ string_of_int !counter in
+      let decl = Decl (temp_var, expr) in
+      ([decl], VarSet.singleton temp_var, ExprStmt (Var temp_var))
+  
+  | Assign (id, expr) when is_invariant expr loop_vars && not (VarSet.mem id loop_vars) ->
+      (* 提取赋值不变量 *)
+      counter := !counter + 1;
+      let temp_var = "__licm_" ^ string_of_int !counter in
+      let decl = Decl (temp_var, expr) in
+      ([decl], VarSet.singleton temp_var, Assign (id, Var temp_var))
+  
+  | Decl (id, expr) when is_invariant expr loop_vars && not (VarSet.mem id loop_vars) ->
+      (* 提取声明不变量 *)
+      counter := !counter + 1;
+      let temp_var = "__licm_" ^ string_of_int !counter in
+      let decl = Decl (temp_var, expr) in
+      ([decl], VarSet.singleton temp_var, Decl (id, Var temp_var))
+  
+  | If (cond, then_stmt, else_stmt_opt) ->
+      let cond_invariant = is_invariant cond loop_vars in
+      let then_invars, then_vars, then_stmt' = extract_invariants counter loop_vars then_stmt in
+      let else_invars, else_vars, else_stmt_opt' = 
+        match else_stmt_opt with
+        | Some s ->
+            let i, v, s' = extract_invariants counter loop_vars s in
+            (i, v, Some s')
+        | None -> ([], VarSet.empty, None)
+      in
+      
+      (* 公共不变量可以外提到if语句外 *)
+      let common_invars = List.filter (fun inv1 ->
+        List.exists (fun inv2 -> inv1 = inv2) else_invars
+      ) then_invars in
+      
+      let then_only_invars = List.filter (fun inv ->
+        not (List.exists (fun inv' -> inv = inv') common_invars)
+      ) then_invars in
+      
+      let else_only_invars = List.filter (fun inv ->
+        not (List.exists (fun inv' -> inv = inv') common_invars)
+      ) else_invars in
+      
+      let var_map = VarSet.union then_vars else_vars in
+      
+      let new_then = Block (then_only_invars @ [then_stmt']) in
+      let new_else_opt = Option.map (fun s -> Block (else_only_invars @ [s])) else_stmt_opt' in
+      
+      let cond_decl, cond_var, new_cond = 
+        if cond_invariant then (
+          counter := !counter + 1;
+          let temp_var = "__licm_cond_" ^ string_of_int !counter in
+          ([Decl (temp_var, cond)], VarSet.singleton temp_var, Var temp_var)
+        ) else (
+          ([], VarSet.empty, cond)
+        )
+      in
+      
+      let all_invars = cond_decl @ common_invars in
+      let all_vars = VarSet.union cond_var var_map in
+      
+      (all_invars, all_vars, If (new_cond, new_then, new_else_opt))
+  
+  | While (cond, body) ->
+      (* 处理嵌套循环 - 先处理内层循环 *)
+      let loop_vars = get_assigned_vars body in
+      let body_invars, body_var_map, new_body = extract_invariants counter loop_vars body in
+      (body_invars, body_var_map, While (cond, new_body))
+  
+  | _ -> ([], VarSet.empty, stmt)  (* 不是不变量，返回原语句 *)
 
-(* 处理循环结构，外提不变量 (使用计数器生成唯一变量名) *)
-let rec lift_loop_invariants (counter: int ref) (stmt: stmt) : stmt =
+(* 对语句应用LICM *)
+let rec licm_stmt (counter: int ref) stmt =
   match stmt with
   | While (cond, body) ->
-      (* 1. 分析循环体获取循环变量 *)
-      let loop_vars = assigned_vars_in_stmt body in
+      (* 计算循环中被修改的变量 *)
+      let loop_vars = get_assigned_vars body in
       
-      (* 2. 分析循环条件是否为不变量，使用计数器生成唯一变量名 *)
-      let (cond_invar, new_cond) = 
-        if is_invariant loop_vars cond then
-          let temp = Printf.sprintf "__licm_cond_%d" !counter in
+      (* 检查循环条件是否是不变量 *)
+      let cond_invariant = is_invariant cond loop_vars in
+      let cond_decl, new_cond =
+        if cond_invariant then (
           counter := !counter + 1;
-          (Some (Decl (temp, cond)), Var temp)
-        else
-          (None, cond)
+          let temp_var = "__licm_cond_" ^ string_of_int !counter in
+          ([Decl (temp_var, cond)], Var temp_var)
+        ) else (
+          ([], cond)
+        )
       in
       
-      (* 3. 从循环体提取不变量 *)
-      let body_stmts = match body with
-        | Block stmts -> stmts
-        | s -> [s]
-      in
-      let (invariants, remaining_body) = extract_invariants loop_vars body_stmts in
+      (* 从循环体中提取不变量 *)
+      let invariants, var_map, new_body = extract_invariants counter loop_vars body in
       
-      (* 4. 递归处理剩余语句中的循环，传递计数器 *)
-      let processed_body = List.map (lift_loop_invariants counter) remaining_body in
+      (* 重写循环体，使用外提的变量 *)
+      let rewritten_body = rewrite_stmt new_body var_map in
       
-      (* 5. 重组循环结构 *)
-      let new_body = Block processed_body in
-      let pre_loop = 
-        (match cond_invar with Some c -> [c] | None -> []) @ invariants 
-      in
-      
-      if pre_loop = [] then
-        While (new_cond, new_body)
-      else
-        Block (pre_loop @ [While (new_cond, new_body)])
+      (* 创建新的循环结构：外提的不变量 + 新循环 *)
+      Block (cond_decl @ invariants @ [While (new_cond, rewritten_body)])
   
-  (* 递归处理嵌套结构，传递计数器 *)
   | Block stmts ->
-      Block (List.map (lift_loop_invariants counter) stmts)
-  | If (cond, then_stmt, else_opt) ->
-      let then' = lift_loop_invariants counter then_stmt in
-      let else' = Option.map (lift_loop_invariants counter) else_opt in
-      If (cond, then', else')
-  | _ -> stmt  (* 其他语句不处理 *)
+      Block (List.map (licm_stmt counter) stmts)
+  
+  | If (cond, then_stmt, else_stmt_opt) ->
+      let new_then = licm_stmt counter then_stmt in
+      let new_else_opt = Option.map (licm_stmt counter) else_stmt_opt in
+      If (cond, new_then, new_else_opt)
+  
+  | _ -> stmt  (* 其他语句不变 *)
 
-(* 处理单个函数的LICM，为每个函数创建独立计数器 *)
-let lift_invariant_code_func (func: func_def) : func_def =
-  let counter = ref 0 in  (* 为每个函数创建独立的计数器 *)
-  { func with body = List.map (lift_loop_invariants counter) func.body }
+(* 对函数应用LICM *)
+let licm_func (func: func_def) : func_def =
+  let counter = ref 0 in
+  { func with body = List.map (licm_stmt counter) func.body }
 
-(* 处理整个程序的LICM *)
-let lift_invariant_code (program: program) : program =
-  List.map lift_invariant_code_func program
+(* LICM优化入口 *)
+let lift_loop_invariants (program: program) : program =
+  List.map licm_func program
 
 
 (*****************************************************************************)
-(* 优化流水线                                                                *)
+(* 更新后的优化流水线                                                        *)
 (*****************************************************************************)
 
 let optimize program =
   program 
-  |> fold_constants                (* 1. 常量折叠 *)
-  |> eliminate_common_subexprs      (* 2. 公共子表达式消除 *)
-  |> lift_invariant_code            (* 3. 循环不变量外提 *)
-  |> eliminate_dead_code            (* 4. 死代码消除 *)
-  |> optimize_tail_recursion        (* 5. 尾递归优化 *)
+  |> fold_constants                 (* 1. 常量折叠 *)
+  |> eliminate_common_subexpressions (* 2. 公共子表达式消除 (新增) *)
+  |> lift_loop_invariants            (* 3. 循环不变量外提 (新增) *)
+  |> eliminate_dead_code             (* 4. 死代码消除 *)
+  |> optimize_tail_recursion         (* 5. 尾递归优化 *)
+    
